@@ -875,17 +875,27 @@ document.addEventListener('DOMContentLoaded', async function () {
             if (charCount) charCount.textContent = textArea.value.length;
         }
         const genParams = presetData.params || presetData;
-        if (temperatureSlider && genParams.temperature !== undefined) temperatureSlider.value = genParams.temperature;
-        if (exaggerationSlider && genParams.exaggeration !== undefined) exaggerationSlider.value = genParams.exaggeration;
-        if (cfgWeightSlider && genParams.cfg_weight !== undefined) cfgWeightSlider.value = genParams.cfg_weight;
-        if (speedFactorSlider && genParams.speed_factor !== undefined) speedFactorSlider.value = genParams.speed_factor;
-        if (seedInput && genParams.seed !== undefined) seedInput.value = genParams.seed;
-        if (languageSelect && genParams.language !== undefined) languageSelect.value = genParams.language;
-        if (temperatureValueDisplay && temperatureSlider) temperatureValueDisplay.textContent = temperatureSlider.value;
-        if (exaggerationValueDisplay && exaggerationSlider) exaggerationValueDisplay.textContent = exaggerationSlider.value;
-        if (cfgWeightValueDisplay && cfgWeightSlider) cfgWeightValueDisplay.textContent = cfgWeightSlider.value;
-        if (speedFactorValueDisplay && speedFactorSlider) speedFactorValueDisplay.textContent = speedFactorSlider.value;
-        updateSpeedFactorWarning();
+        // Los presets solo traen ejemplos en inglés (texto y parámetros pensados
+        // para esa demo). Al restaurar el preset guardado en silencio al cargar
+        // la página (isUserInteraction=false, textArea vacío -- ver
+        // loadInitialUiState), esto pisaba el idioma/exaggeration/cfg_weight/etc.
+        // que el usuario había guardado como default (p.ej. "es"), forzándolo de
+        // vuelta a los valores del preset en cada carga. Cuando el usuario elige
+        // un preset a propósito (isUserInteraction=true, click real) sí tiene
+        // sentido aplicar también sus parámetros de ejemplo.
+        if (isUserInteraction) {
+            if (temperatureSlider && genParams.temperature !== undefined) temperatureSlider.value = genParams.temperature;
+            if (exaggerationSlider && genParams.exaggeration !== undefined) exaggerationSlider.value = genParams.exaggeration;
+            if (cfgWeightSlider && genParams.cfg_weight !== undefined) cfgWeightSlider.value = genParams.cfg_weight;
+            if (speedFactorSlider && genParams.speed_factor !== undefined) speedFactorSlider.value = genParams.speed_factor;
+            if (seedInput && genParams.seed !== undefined) seedInput.value = genParams.seed;
+            if (languageSelect && genParams.language !== undefined) languageSelect.value = genParams.language;
+            if (temperatureValueDisplay && temperatureSlider) temperatureValueDisplay.textContent = temperatureSlider.value;
+            if (exaggerationValueDisplay && exaggerationSlider) exaggerationValueDisplay.textContent = exaggerationSlider.value;
+            if (cfgWeightValueDisplay && cfgWeightSlider) cfgWeightValueDisplay.textContent = cfgWeightSlider.value;
+            if (speedFactorValueDisplay && speedFactorSlider) speedFactorValueDisplay.textContent = speedFactorSlider.value;
+            updateSpeedFactorWarning();
+        }
 
         if (genParams.voice_id && predefinedVoiceSelect) {
             const voiceExists = Array.from(predefinedVoiceSelect.options).some(opt => opt.value === genParams.voice_id);
