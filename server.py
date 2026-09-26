@@ -72,6 +72,12 @@ import utils  # Utility functions
 
 from pydantic import BaseModel, Field
 
+# Serializa el acceso real al modelo cargado (un solo modelo en memoria, MPS/CUDA).
+# `run_in_executor(None, ...)` usa el ThreadPoolExecutor por defecto, que tiene
+# varios hilos: sin este lock, dos síntesis concurrentes (/tts + /v1/audio/speech,
+# o dos /tts) podrían llamar a `engine.synthesize()` a la vez desde hilos distintos.
+_ENGINE_LOCK = threading.Lock()
+
 
 class OpenAISpeechRequest(BaseModel):
     model: str
@@ -1015,17 +1021,20 @@ async def custom_tts_endpoint(
                 is_last = i == len(text_chunks) - 1
                 logger.info(f"Streaming chunk {i+1}/{len(text_chunks)}...")
 
+                def _synthesize_chunk_locked(c=chunk_text):
+                    with _ENGINE_LOCK:
+                        return engine.synthesize(
+                            text=c,
+                            audio_prompt_path=audio_prompt_str,
+                            temperature=temperature_val,
+                            exaggeration=exaggeration_val,
+                            cfg_weight=cfg_weight_val,
+                            seed=seed_val,
+                            language=language_val,
+                        )
+
                 audio_tensor, chunk_sr = await loop.run_in_executor(
-                    None,
-                    lambda c=chunk_text: engine.synthesize(
-                        text=c,
-                        audio_prompt_path=audio_prompt_str,
-                        temperature=temperature_val,
-                        exaggeration=exaggeration_val,
-                        cfg_weight=cfg_weight_val,
-                        seed=seed_val,
-                        language=language_val,
-                    ),
+                    None, _synthesize_chunk_locked
                 )
 
                 if audio_tensor is None or chunk_sr is None:
@@ -1068,269 +1077,287 @@ async def custom_tts_endpoint(
         )
     # --- End streaming fork ---
 
-    for i, chunk in enumerate(text_chunks):
-        logger.info(f"Synthesizing chunk {i+1}/{len(text_chunks)}...")
-        try:
-            chunk_audio_tensor, chunk_sr_from_engine = engine.synthesize(
-                text=chunk,
-                audio_prompt_path=(
-                    str(audio_prompt_path_for_engine)
-                    if audio_prompt_path_for_engine
-                    else None
-                ),
-                temperature=(
-                    request.temperature
-                    if request.temperature is not None
-                    else get_gen_default_temperature()
-                ),
-                exaggeration=(
-                    request.exaggeration
-                    if request.exaggeration is not None
-                    else get_gen_default_exaggeration()
-                ),
-                cfg_weight=(
-                    request.cfg_weight
-                    if request.cfg_weight is not None
-                    else get_gen_default_cfg_weight()
-                ),
-                seed=(
-                    request.seed if request.seed is not None else get_gen_default_seed()
-                ),
-                language=(
-                    request.language
-                    if request.language is not None
-                    else get_gen_default_language()
-                ),
-            )
-            perf_monitor.record(f"Engine synthesized chunk {i+1}")
-
-            if chunk_audio_tensor is None or chunk_sr_from_engine is None:
-                error_detail = f"TTS engine failed to synthesize audio for chunk {i+1}."
-                logger.error(error_detail)
-                raise HTTPException(status_code=500, detail=error_detail)
-
-            if engine_output_sample_rate is None:
-                engine_output_sample_rate = chunk_sr_from_engine
-            elif engine_output_sample_rate != chunk_sr_from_engine:
-                logger.warning(
-                    f"Inconsistent sample rate from engine: chunk {i+1} ({chunk_sr_from_engine}Hz) "
-                    f"differs from previous ({engine_output_sample_rate}Hz). Using first chunk's SR."
-                )
-
-            current_processed_audio_tensor = chunk_audio_tensor
-
-            speed_factor_to_use = (
-                request.speed_factor
-                if request.speed_factor is not None
-                else get_gen_default_speed_factor()
-            )
-            if speed_factor_to_use != 1.0:
-                current_processed_audio_tensor, _ = utils.apply_speed_factor(
-                    current_processed_audio_tensor,
-                    chunk_sr_from_engine,
-                    speed_factor_to_use,
-                )
-                perf_monitor.record(f"Speed factor applied to chunk {i+1}")
-
-            # ### MODIFICATION ###
-            # All other processing is REMOVED from the loop.
-            # We will process the final concatenated audio clip.
-            processed_audio_np = current_processed_audio_tensor.cpu().numpy().squeeze()
-            all_audio_segments_np.append(processed_audio_np)
-
-        except HTTPException as http_exc:
-            raise http_exc
-        except Exception as e_chunk:
-            error_detail = f"Error processing audio chunk {i+1}: {str(e_chunk)}"
-            logger.error(error_detail, exc_info=True)
-            raise HTTPException(status_code=500, detail=error_detail)
-
-    if not all_audio_segments_np:
-        logger.error("No audio segments were successfully generated.")
-        raise HTTPException(
-            status_code=500, detail="Audio generation resulted in no output."
-        )
-
-    if engine_output_sample_rate is None:
-        logger.error("Engine output sample rate could not be determined.")
-        raise HTTPException(
-            status_code=500, detail="Failed to determine engine sample rate."
-        )
-    try:
-        # ### SMART AUDIO STITCHING ###
-        # Local constants - adjust these values to tune stitching behavior
-        SENTENCE_PAUSE_MS = 200  # Desired audible silence between sentences
-        CROSSFADE_MS = 20  # Crossfade duration for smart mode (10-50ms recommended)
-        SAFETY_FADE_MS = 3  # Minimal edge fade for fallback mode (2-5ms)
-        ENABLE_DC_REMOVAL = False  # Set True if you hear low-frequency thumps
-        DC_HIGHPASS_HZ = 15  # High-pass cutoff for DC removal
-        PEAK_NORMALIZE_THRESHOLD = 0.99  # Normalize if peak exceeds this
-        PEAK_NORMALIZE_TARGET = 0.95  # Target peak after normalization
-
-        # Read smart stitching toggle from config (defaults to True)
-        enable_smart_stitching = config_manager.get_bool(
-            "audio_processing.enable_crossfade", True
-        )
-
-        # --- Sample rate validation ---
-        if not engine_output_sample_rate or engine_output_sample_rate <= 0:
-            logger.error(
-                f"Invalid sample rate: {engine_output_sample_rate}, "
-                "falling back to raw concatenation"
-            )
-            final_audio_np = (
-                np.concatenate(all_audio_segments_np)
-                if len(all_audio_segments_np) > 1
-                else all_audio_segments_np[0]
-            )
-
-        elif len(all_audio_segments_np) == 1:
-            # Single chunk - no stitching needed
-            final_audio_np = all_audio_segments_np[0]
-            logger.info("Single audio chunk - no stitching required")
-
-        elif enable_smart_stitching:
-            # --- Smart mode: true crossfading with silence insertion ---
-            fade_samples = int(CROSSFADE_MS / 1000 * engine_output_sample_rate)
-
-            # Calculate silence buffer with compensation for crossfade overlap
-            # Each crossfade removes fade_samples from silence (one at each end)
-            desired_silence_samples = int(
-                SENTENCE_PAUSE_MS / 1000 * engine_output_sample_rate
-            )
-            silence_buffer_samples = desired_silence_samples + (fade_samples * 2)
-
-            # Preprocess chunks: convert to float32 and optionally remove DC offset
-            chunks = []
-            for chunk in all_audio_segments_np:
-                processed = chunk.astype(np.float32, copy=True)
-                if ENABLE_DC_REMOVAL:
-                    processed = _remove_dc_offset(
-                        processed, engine_output_sample_rate, DC_HIGHPASS_HZ
-                    )
-                chunks.append(processed)
-
-            # Start with first chunk
-            result = chunks[0]
-
-            # Stitch remaining chunks with crossfaded silence gaps
-            for i in range(1, len(chunks)):
-                # Create silence buffer (oversized to compensate for crossfade overlap)
-                silence = np.zeros(silence_buffer_samples, dtype=np.float32)
-
-                # Crossfade: current result → silence (speech fades into silence)
-                result = _crossfade_with_overlap(result, silence, fade_samples)
-
-                # Crossfade: result → next chunk (silence fades into speech)
-                result = _crossfade_with_overlap(result, chunks[i], fade_samples)
-
-            final_audio_np = result
-            logger.info(
-                f"Smart stitching applied: {len(chunks)} chunks, "
-                f"{CROSSFADE_MS}ms crossfades, {SENTENCE_PAUSE_MS}ms pauses"
-            )
-
-        else:
-            # --- Fallback mode: minimal safety edge fades, no silence ---
-            fade_samples = int(SAFETY_FADE_MS / 1000 * engine_output_sample_rate)
-            num_chunks = len(all_audio_segments_np)
-
-            processed_chunks = []
-            for i, chunk in enumerate(all_audio_segments_np):
-                is_first = i == 0
-                is_last = i == num_chunks - 1
-
-                processed = _apply_edge_fades(
-                    chunk,
-                    fade_samples,
-                    fade_in=(not is_first),  # No fade-in on first chunk
-                    fade_out=(not is_last),  # No fade-out on last chunk
-                )
-                processed_chunks.append(processed)
-
-            final_audio_np = np.concatenate(processed_chunks)
-            logger.info(
-                f"Safety edge fades applied: {num_chunks} chunks, "
-                f"{SAFETY_FADE_MS}ms linear fades"
-            )
-
-        # --- Ensure float32 dtype for all code paths ---
-        final_audio_np = final_audio_np.astype(np.float32, copy=False)
-
-        # --- Normalize to prevent clipping ---
-        peak_amplitude = np.abs(final_audio_np).max()
-        if peak_amplitude > PEAK_NORMALIZE_THRESHOLD:
-            final_audio_np = final_audio_np * (PEAK_NORMALIZE_TARGET / peak_amplitude)
-            logger.warning(
-                f"Audio normalized to prevent clipping (peak was {peak_amplitude:.3f})"
-            )
-
-        perf_monitor.record("Audio chunks stitched")
-
-        # --- Global Audio Post-Processing (applied to complete stitched audio) ---
-        if config_manager.get_bool("audio_processing.enable_silence_trimming", False):
-            final_audio_np = utils.trim_lead_trail_silence(
-                final_audio_np, engine_output_sample_rate
-            )
-            perf_monitor.record("Global silence trim applied")
-
-        if config_manager.get_bool(
-            "audio_processing.enable_internal_silence_fix", False
-        ):
-            final_audio_np = utils.fix_internal_silence(
-                final_audio_np, engine_output_sample_rate
-            )
-            perf_monitor.record("Global internal silence fix applied")
-
-        if (
-            config_manager.get_bool("audio_processing.enable_unvoiced_removal", False)
-            and utils.PARSELMOUTH_AVAILABLE
-        ):
-            final_audio_np = utils.remove_long_unvoiced_segments(
-                final_audio_np, engine_output_sample_rate
-            )
-            perf_monitor.record("Global unvoiced removal applied")
-
-        # --- Warn about potentially conflicting settings ---
-        if enable_smart_stitching and config_manager.get_bool(
-            "audio_processing.enable_silence_trimming", False
-        ):
-            logger.warning(
-                "Smart stitching adds sentence pauses, but silence trimming is enabled. "
-                "Leading/trailing pauses may be removed."
-            )
-        # ### SMART AUDIO STITCHING END ###
-
-    except ValueError as e_concat:
-        logger.error(f"Audio concatenation/stitching failed: {e_concat}", exc_info=True)
-        for idx, seg in enumerate(all_audio_segments_np):
-            logger.error(f"Segment {idx} shape: {seg.shape}, dtype: {seg.dtype}")
-        raise HTTPException(
-            status_code=500, detail=f"Audio stitching error: {e_concat}"
-        )
-
     output_format_str = (
         request.output_format if request.output_format else get_audio_output_format()
     )
 
-    encoded_audio_bytes = utils.encode_audio(
-        audio_array=final_audio_np,
-        sample_rate=engine_output_sample_rate,
-        output_format=output_format_str,
-        target_sample_rate=final_output_sample_rate,
-    )
-    perf_monitor.record(
-        f"Final audio encoded to {output_format_str} (target SR: {final_output_sample_rate}Hz from engine SR: {engine_output_sample_rate}Hz)"
-    )
+    def _synthesize_and_encode() -> bytes:
+        """Corre en un hilo del executor (`run_in_executor` más abajo). Antes esta
+        síntesis completa (potencialmente varios minutos con texto largo) se
+        ejecutaba síncronamente dentro de esta misma ruta `async def`, bloqueando
+        el único event loop de uvicorn (`workers=1`) durante toda la generación:
+        cualquier otra petición concurrente (p.ej. /save_settings, que ni siquiera
+        toca `engine`) se quedaba sin respuesta hasta que terminaba. Reproducido en
+        vivo: 8 llamadas a /save_settings durante un /tts de ~300s no recibieron
+        respuesta alguna. `_ENGINE_LOCK` serializa el acceso real al modelo (el
+        executor por defecto tiene varios hilos)."""
+        nonlocal engine_output_sample_rate
+        for i, chunk in enumerate(text_chunks):
+            logger.info(f"Synthesizing chunk {i+1}/{len(text_chunks)}...")
+            try:
+                with _ENGINE_LOCK:
+                    chunk_audio_tensor, chunk_sr_from_engine = engine.synthesize(
+                        text=chunk,
+                        audio_prompt_path=(
+                            str(audio_prompt_path_for_engine)
+                            if audio_prompt_path_for_engine
+                            else None
+                        ),
+                        temperature=(
+                            request.temperature
+                            if request.temperature is not None
+                            else get_gen_default_temperature()
+                        ),
+                        exaggeration=(
+                            request.exaggeration
+                            if request.exaggeration is not None
+                            else get_gen_default_exaggeration()
+                        ),
+                        cfg_weight=(
+                            request.cfg_weight
+                            if request.cfg_weight is not None
+                            else get_gen_default_cfg_weight()
+                        ),
+                        seed=(
+                            request.seed if request.seed is not None else get_gen_default_seed()
+                        ),
+                        language=(
+                            request.language
+                            if request.language is not None
+                            else get_gen_default_language()
+                        ),
+                    )
+                perf_monitor.record(f"Engine synthesized chunk {i+1}")
 
-    if encoded_audio_bytes is None or len(encoded_audio_bytes) < 100:
-        logger.error(
-            f"Failed to encode final audio to format: {output_format_str} or output is too small ({len(encoded_audio_bytes or b'')} bytes)."
+                if chunk_audio_tensor is None or chunk_sr_from_engine is None:
+                    error_detail = f"TTS engine failed to synthesize audio for chunk {i+1}."
+                    logger.error(error_detail)
+                    raise HTTPException(status_code=500, detail=error_detail)
+
+                if engine_output_sample_rate is None:
+                    engine_output_sample_rate = chunk_sr_from_engine
+                elif engine_output_sample_rate != chunk_sr_from_engine:
+                    logger.warning(
+                        f"Inconsistent sample rate from engine: chunk {i+1} ({chunk_sr_from_engine}Hz) "
+                        f"differs from previous ({engine_output_sample_rate}Hz). Using first chunk's SR."
+                    )
+
+                current_processed_audio_tensor = chunk_audio_tensor
+
+                speed_factor_to_use = (
+                    request.speed_factor
+                    if request.speed_factor is not None
+                    else get_gen_default_speed_factor()
+                )
+                if speed_factor_to_use != 1.0:
+                    current_processed_audio_tensor, _ = utils.apply_speed_factor(
+                        current_processed_audio_tensor,
+                        chunk_sr_from_engine,
+                        speed_factor_to_use,
+                    )
+                    perf_monitor.record(f"Speed factor applied to chunk {i+1}")
+
+                # ### MODIFICATION ###
+                # All other processing is REMOVED from the loop.
+                # We will process the final concatenated audio clip.
+                processed_audio_np = current_processed_audio_tensor.cpu().numpy().squeeze()
+                all_audio_segments_np.append(processed_audio_np)
+
+            except HTTPException as http_exc:
+                raise http_exc
+            except Exception as e_chunk:
+                error_detail = f"Error processing audio chunk {i+1}: {str(e_chunk)}"
+                logger.error(error_detail, exc_info=True)
+                raise HTTPException(status_code=500, detail=error_detail)
+
+        if not all_audio_segments_np:
+            logger.error("No audio segments were successfully generated.")
+            raise HTTPException(
+                status_code=500, detail="Audio generation resulted in no output."
+            )
+
+        if engine_output_sample_rate is None:
+            logger.error("Engine output sample rate could not be determined.")
+            raise HTTPException(
+                status_code=500, detail="Failed to determine engine sample rate."
+            )
+        try:
+            # ### SMART AUDIO STITCHING ###
+            # Local constants - adjust these values to tune stitching behavior
+            SENTENCE_PAUSE_MS = 200  # Desired audible silence between sentences
+            CROSSFADE_MS = 20  # Crossfade duration for smart mode (10-50ms recommended)
+            SAFETY_FADE_MS = 3  # Minimal edge fade for fallback mode (2-5ms)
+            ENABLE_DC_REMOVAL = False  # Set True if you hear low-frequency thumps
+            DC_HIGHPASS_HZ = 15  # High-pass cutoff for DC removal
+            PEAK_NORMALIZE_THRESHOLD = 0.99  # Normalize if peak exceeds this
+            PEAK_NORMALIZE_TARGET = 0.95  # Target peak after normalization
+
+            # Read smart stitching toggle from config (defaults to True)
+            enable_smart_stitching = config_manager.get_bool(
+                "audio_processing.enable_crossfade", True
+            )
+
+            # --- Sample rate validation ---
+            if not engine_output_sample_rate or engine_output_sample_rate <= 0:
+                logger.error(
+                    f"Invalid sample rate: {engine_output_sample_rate}, "
+                    "falling back to raw concatenation"
+                )
+                final_audio_np = (
+                    np.concatenate(all_audio_segments_np)
+                    if len(all_audio_segments_np) > 1
+                    else all_audio_segments_np[0]
+                )
+
+            elif len(all_audio_segments_np) == 1:
+                # Single chunk - no stitching needed
+                final_audio_np = all_audio_segments_np[0]
+                logger.info("Single audio chunk - no stitching required")
+
+            elif enable_smart_stitching:
+                # --- Smart mode: true crossfading with silence insertion ---
+                fade_samples = int(CROSSFADE_MS / 1000 * engine_output_sample_rate)
+
+                # Calculate silence buffer with compensation for crossfade overlap
+                # Each crossfade removes fade_samples from silence (one at each end)
+                desired_silence_samples = int(
+                    SENTENCE_PAUSE_MS / 1000 * engine_output_sample_rate
+                )
+                silence_buffer_samples = desired_silence_samples + (fade_samples * 2)
+
+                # Preprocess chunks: convert to float32 and optionally remove DC offset
+                chunks = []
+                for chunk in all_audio_segments_np:
+                    processed = chunk.astype(np.float32, copy=True)
+                    if ENABLE_DC_REMOVAL:
+                        processed = _remove_dc_offset(
+                            processed, engine_output_sample_rate, DC_HIGHPASS_HZ
+                        )
+                    chunks.append(processed)
+
+                # Start with first chunk
+                result = chunks[0]
+
+                # Stitch remaining chunks with crossfaded silence gaps
+                for i in range(1, len(chunks)):
+                    # Create silence buffer (oversized to compensate for crossfade overlap)
+                    silence = np.zeros(silence_buffer_samples, dtype=np.float32)
+
+                    # Crossfade: current result → silence (speech fades into silence)
+                    result = _crossfade_with_overlap(result, silence, fade_samples)
+
+                    # Crossfade: result → next chunk (silence fades into speech)
+                    result = _crossfade_with_overlap(result, chunks[i], fade_samples)
+
+                final_audio_np = result
+                logger.info(
+                    f"Smart stitching applied: {len(chunks)} chunks, "
+                    f"{CROSSFADE_MS}ms crossfades, {SENTENCE_PAUSE_MS}ms pauses"
+                )
+
+            else:
+                # --- Fallback mode: minimal safety edge fades, no silence ---
+                fade_samples = int(SAFETY_FADE_MS / 1000 * engine_output_sample_rate)
+                num_chunks = len(all_audio_segments_np)
+
+                processed_chunks = []
+                for i, chunk in enumerate(all_audio_segments_np):
+                    is_first = i == 0
+                    is_last = i == num_chunks - 1
+
+                    processed = _apply_edge_fades(
+                        chunk,
+                        fade_samples,
+                        fade_in=(not is_first),  # No fade-in on first chunk
+                        fade_out=(not is_last),  # No fade-out on last chunk
+                    )
+                    processed_chunks.append(processed)
+
+                final_audio_np = np.concatenate(processed_chunks)
+                logger.info(
+                    f"Safety edge fades applied: {num_chunks} chunks, "
+                    f"{SAFETY_FADE_MS}ms linear fades"
+                )
+
+            # --- Ensure float32 dtype for all code paths ---
+            final_audio_np = final_audio_np.astype(np.float32, copy=False)
+
+            # --- Normalize to prevent clipping ---
+            peak_amplitude = np.abs(final_audio_np).max()
+            if peak_amplitude > PEAK_NORMALIZE_THRESHOLD:
+                final_audio_np = final_audio_np * (PEAK_NORMALIZE_TARGET / peak_amplitude)
+                logger.warning(
+                    f"Audio normalized to prevent clipping (peak was {peak_amplitude:.3f})"
+                )
+
+            perf_monitor.record("Audio chunks stitched")
+
+            # --- Global Audio Post-Processing (applied to complete stitched audio) ---
+            if config_manager.get_bool("audio_processing.enable_silence_trimming", False):
+                final_audio_np = utils.trim_lead_trail_silence(
+                    final_audio_np, engine_output_sample_rate
+                )
+                perf_monitor.record("Global silence trim applied")
+
+            if config_manager.get_bool(
+                "audio_processing.enable_internal_silence_fix", False
+            ):
+                final_audio_np = utils.fix_internal_silence(
+                    final_audio_np, engine_output_sample_rate
+                )
+                perf_monitor.record("Global internal silence fix applied")
+
+            if (
+                config_manager.get_bool("audio_processing.enable_unvoiced_removal", False)
+                and utils.PARSELMOUTH_AVAILABLE
+            ):
+                final_audio_np = utils.remove_long_unvoiced_segments(
+                    final_audio_np, engine_output_sample_rate
+                )
+                perf_monitor.record("Global unvoiced removal applied")
+
+            # --- Warn about potentially conflicting settings ---
+            if enable_smart_stitching and config_manager.get_bool(
+                "audio_processing.enable_silence_trimming", False
+            ):
+                logger.warning(
+                    "Smart stitching adds sentence pauses, but silence trimming is enabled. "
+                    "Leading/trailing pauses may be removed."
+                )
+            # ### SMART AUDIO STITCHING END ###
+
+        except ValueError as e_concat:
+            logger.error(f"Audio concatenation/stitching failed: {e_concat}", exc_info=True)
+            for idx, seg in enumerate(all_audio_segments_np):
+                logger.error(f"Segment {idx} shape: {seg.shape}, dtype: {seg.dtype}")
+            raise HTTPException(
+                status_code=500, detail=f"Audio stitching error: {e_concat}"
+            )
+
+        encoded_audio_bytes = utils.encode_audio(
+            audio_array=final_audio_np,
+            sample_rate=engine_output_sample_rate,
+            output_format=output_format_str,
+            target_sample_rate=final_output_sample_rate,
         )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to encode audio to {output_format_str} or generated invalid audio.",
+        perf_monitor.record(
+            f"Final audio encoded to {output_format_str} (target SR: {final_output_sample_rate}Hz from engine SR: {engine_output_sample_rate}Hz)"
         )
+
+        if encoded_audio_bytes is None or len(encoded_audio_bytes) < 100:
+            logger.error(
+                f"Failed to encode final audio to format: {output_format_str} or output is too small ({len(encoded_audio_bytes or b'')} bytes)."
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to encode audio to {output_format_str} or generated invalid audio.",
+            )
+        return encoded_audio_bytes
+
+    _t0 = time.monotonic()
+    loop = asyncio.get_running_loop()
+    encoded_audio_bytes = await loop.run_in_executor(None, _synthesize_and_encode)
+    logger.info(f"Non-streaming /tts generation took {time.monotonic() - _t0:.1f}s wall-clock.")
 
     media_type = f"audio/{output_format_str}"
     timestamp_str = time.strftime("%Y%m%d_%H%M%S")
@@ -1419,125 +1446,137 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         )
 
     try:
-        seed_to_use = (
-            request.seed if request.seed is not None else get_gen_default_seed()
-        )
-
-        # Split long text into chunks for better quality (same as /tts endpoint)
-        DEFAULT_CHUNK_SIZE = 120
-        text_chunks = utils.chunk_text_by_sentences(request.input_, DEFAULT_CHUNK_SIZE)
-        if not text_chunks:
-            raise HTTPException(
-                status_code=400, detail="Text processing resulted in no usable chunks."
+        def _generate_openai_speech() -> StreamingResponse:
+            """Corre en un hilo del executor -- ver el comentario equivalente en
+            `custom_tts_endpoint._synthesize_and_encode`: sin offload, esta síntesis
+            bloqueaba el único event loop de uvicorn igual que el /tts no-streaming
+            (mismo bug, mismo archivo, ruta distinta)."""
+            seed_to_use = (
+                request.seed if request.seed is not None else get_gen_default_seed()
             )
 
-        logger.info(
-            f"OpenAI speech: processing {len(text_chunks)} chunk(s) for input of {len(request.input_)} chars"
-        )
-
-        all_audio_segments_np: List[np.ndarray] = []
-        engine_sr: Optional[int] = None
-
-        for i, chunk_text in enumerate(text_chunks):
-            chunk_seed = seed_to_use + i if seed_to_use is not None and seed_to_use >= 0 else seed_to_use
-
-            audio_tensor, sr = engine.synthesize(
-                text=chunk_text,
-                audio_prompt_path=str(audio_prompt_path),
-                temperature=get_gen_default_temperature(),
-                exaggeration=get_gen_default_exaggeration(),
-                cfg_weight=get_gen_default_cfg_weight(),
-                seed=chunk_seed,
-                language=request.language or get_gen_default_language(),
-            )
-
-            if audio_tensor is None or sr is None:
+            # Split long text into chunks for better quality (same as /tts endpoint)
+            DEFAULT_CHUNK_SIZE = 120
+            text_chunks = utils.chunk_text_by_sentences(request.input_, DEFAULT_CHUNK_SIZE)
+            if not text_chunks:
                 raise HTTPException(
-                    status_code=500,
-                    detail=f"TTS engine failed to synthesize audio for chunk {i+1}.",
+                    status_code=400, detail="Text processing resulted in no usable chunks."
                 )
 
-            if engine_sr is None:
-                engine_sr = sr
-
-            if request.speed != 1.0:
-                audio_tensor, _ = utils.apply_speed_factor(audio_tensor, sr, request.speed)
-
-            chunk_np = audio_tensor.cpu().numpy().squeeze().astype(np.float32)
-            all_audio_segments_np.append(chunk_np)
-
-        # Stitch chunks together with crossfading
-        if len(all_audio_segments_np) == 1:
-            final_audio_np = all_audio_segments_np[0]
-        else:
-            CROSSFADE_MS = 20
-            SENTENCE_PAUSE_MS = 200
-            fade_samples = int(CROSSFADE_MS / 1000 * engine_sr)
-            silence_buffer_samples = int(SENTENCE_PAUSE_MS / 1000 * engine_sr) + (fade_samples * 2)
-
-            result = all_audio_segments_np[0].astype(np.float32)
-            for seg in all_audio_segments_np[1:]:
-                seg = seg.astype(np.float32)
-                silence = np.zeros(silence_buffer_samples, dtype=np.float32)
-                result = _crossfade_with_overlap(result, silence, fade_samples)
-                result = _crossfade_with_overlap(result, seg, fade_samples)
-            final_audio_np = result
             logger.info(
-                f"OpenAI speech: stitched {len(all_audio_segments_np)} chunks with {CROSSFADE_MS}ms crossfades"
+                f"OpenAI speech: processing {len(text_chunks)} chunk(s) for input of {len(request.input_)} chars"
             )
 
-        # Normalize to prevent clipping
-        peak = np.abs(final_audio_np).max()
-        if peak > 0.99:
-            final_audio_np = final_audio_np * (0.95 / peak)
+            all_audio_segments_np: List[np.ndarray] = []
+            engine_sr: Optional[int] = None
 
-        encoded_audio = utils.encode_audio(
-            audio_array=final_audio_np,
-            sample_rate=engine_sr,
-            output_format=request.response_format,
-            target_sample_rate=get_audio_sample_rate(),
-        )
+            for i, chunk_text in enumerate(text_chunks):
+                chunk_seed = seed_to_use + i if seed_to_use is not None and seed_to_use >= 0 else seed_to_use
 
-        if encoded_audio is None:
-            raise HTTPException(status_code=500, detail="Failed to encode audio.")
-
-        media_type = f"audio/{request.response_format}"
-
-        # Optional: Save to disk if enabled
-        if config_manager.get_bool("audio_output.save_to_disk", False):
-            output_dir = get_output_path(ensure_absolute=True)
-            timestamp_str = time.strftime("%Y%m%d_%H%M%S")
-            download_filename = f"openai_tts_{timestamp_str}.{request.response_format}"
-            output_file_path = output_dir / download_filename
-            try:
-                output_dir.mkdir(parents=True, exist_ok=True)
-                with open(output_file_path, "wb") as f:
-                    f.write(encoded_audio)
-                if (
-                    not output_file_path.exists()
-                    or output_file_path.stat().st_size < 100
-                ):
-                    logger.error(
-                        f"File save verification failed for {output_file_path}"
+                with _ENGINE_LOCK:
+                    audio_tensor, sr = engine.synthesize(
+                        text=chunk_text,
+                        audio_prompt_path=str(audio_prompt_path),
+                        temperature=get_gen_default_temperature(),
+                        exaggeration=get_gen_default_exaggeration(),
+                        cfg_weight=get_gen_default_cfg_weight(),
+                        seed=chunk_seed,
+                        language=request.language or get_gen_default_language(),
                     )
+
+                if audio_tensor is None or sr is None:
                     raise HTTPException(
                         status_code=500,
-                        detail=f"Failed to save audio file to {output_file_path}",
+                        detail=f"TTS engine failed to synthesize audio for chunk {i+1}.",
                     )
+
+                if engine_sr is None:
+                    engine_sr = sr
+
+                if request.speed != 1.0:
+                    audio_tensor, _ = utils.apply_speed_factor(audio_tensor, sr, request.speed)
+
+                chunk_np = audio_tensor.cpu().numpy().squeeze().astype(np.float32)
+                all_audio_segments_np.append(chunk_np)
+
+            # Stitch chunks together with crossfading
+            if len(all_audio_segments_np) == 1:
+                final_audio_np = all_audio_segments_np[0]
+            else:
+                CROSSFADE_MS = 20
+                SENTENCE_PAUSE_MS = 200
+                fade_samples = int(CROSSFADE_MS / 1000 * engine_sr)
+                silence_buffer_samples = int(SENTENCE_PAUSE_MS / 1000 * engine_sr) + (fade_samples * 2)
+
+                result = all_audio_segments_np[0].astype(np.float32)
+                for seg in all_audio_segments_np[1:]:
+                    seg = seg.astype(np.float32)
+                    silence = np.zeros(silence_buffer_samples, dtype=np.float32)
+                    result = _crossfade_with_overlap(result, silence, fade_samples)
+                    result = _crossfade_with_overlap(result, seg, fade_samples)
+                final_audio_np = result
                 logger.info(
-                    f"OpenAI-compatible audio saved to disk: {output_file_path}"
-                )
-            except HTTPException:
-                raise
-            except Exception as e:
-                logger.error(
-                    f"Failed to save audio to {output_file_path}: {e}", exc_info=True
-                )
-                raise HTTPException(
-                    status_code=500, detail=f"Failed to save audio file: {e}"
+                    f"OpenAI speech: stitched {len(all_audio_segments_np)} chunks with {CROSSFADE_MS}ms crossfades"
                 )
 
-        return StreamingResponse(io.BytesIO(encoded_audio), media_type=media_type)
+            # Normalize to prevent clipping
+            peak = np.abs(final_audio_np).max()
+            if peak > 0.99:
+                final_audio_np = final_audio_np * (0.95 / peak)
+
+            encoded_audio = utils.encode_audio(
+                audio_array=final_audio_np,
+                sample_rate=engine_sr,
+                output_format=request.response_format,
+                target_sample_rate=get_audio_sample_rate(),
+            )
+
+            if encoded_audio is None:
+                raise HTTPException(status_code=500, detail="Failed to encode audio.")
+
+            media_type = f"audio/{request.response_format}"
+
+            # Optional: Save to disk if enabled
+            if config_manager.get_bool("audio_output.save_to_disk", False):
+                output_dir = get_output_path(ensure_absolute=True)
+                timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+                download_filename = f"openai_tts_{timestamp_str}.{request.response_format}"
+                output_file_path = output_dir / download_filename
+                try:
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    with open(output_file_path, "wb") as f:
+                        f.write(encoded_audio)
+                    if (
+                        not output_file_path.exists()
+                        or output_file_path.stat().st_size < 100
+                    ):
+                        logger.error(
+                            f"File save verification failed for {output_file_path}"
+                        )
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"Failed to save audio file to {output_file_path}",
+                        )
+                    logger.info(
+                        f"OpenAI-compatible audio saved to disk: {output_file_path}"
+                    )
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    logger.error(
+                        f"Failed to save audio to {output_file_path}: {e}", exc_info=True
+                    )
+                    raise HTTPException(
+                        status_code=500, detail=f"Failed to save audio file: {e}"
+                    )
+
+            return StreamingResponse(io.BytesIO(encoded_audio), media_type=media_type)
+
+        _t0 = time.monotonic()
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(None, _generate_openai_speech)
+        logger.info(f"/v1/audio/speech generation took {time.monotonic() - _t0:.1f}s wall-clock.")
+        return response
 
     except Exception as e:
         logger.error(f"Error in openai_speech_endpoint: {e}", exc_info=True)
