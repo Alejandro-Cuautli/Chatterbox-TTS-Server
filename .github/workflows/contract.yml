@@ -1,0 +1,21 @@
+# Hermes Project Contract gate — runs the portable self-check on every PR.
+# Make this a required status check in branch protection to BLOCK drift (Fase 2).
+name: Contract
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches-ignore: [main]
+
+concurrency:
+  group: contract-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    runs-on: [self-hosted, ARM64, synaptic-voice-studio]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hermes Project Contract self-check
+        run: bash .hermes/contract-check.sh

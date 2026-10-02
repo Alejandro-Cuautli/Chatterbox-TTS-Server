@@ -1,0 +1,52 @@
+# Hermes CI — runs on every PR, BEFORE merge to main.
+# This is the second test gate (the first runs inside the agent loop on the
+# worktree). Copy into each project repo as .github/workflows/ci.yml.
+#
+# Auto-detects Node (package.json) and/or Python (pyproject.toml/requirements.txt)
+# and runs lint + test + build. Adjust the commands per project as needed.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  # Allow re-running CI on pushes to feature branches too.
+  push:
+    branches-ignore: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: [self-hosted, ARM64, synaptic-voice-studio]
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Node ----
+      - name: Setup Node
+        if: ${{ hashFiles('package.json') != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Node install + lint + test + build
+        if: ${{ hashFiles('package.json') != '' }}
+        run: |
+          npm ci
+          npm run lint --if-present
+          npm test --if-present
+          npm run build --if-present
+
+      # ---- Python ----
+      - name: Python install + test
+        if: ${{ hashFiles('pyproject.toml', 'requirements.txt') != '' }}
+        run: |
+          python3 -m venv .venv-ci
+          . .venv-ci/bin/activate
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install -e .; fi
+          pip install ruff pytest
+          ruff check .
+          pytest -q

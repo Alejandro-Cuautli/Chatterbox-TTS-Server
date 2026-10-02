@@ -1,0 +1,38 @@
+# Self-hosted on vps_04. The runner sits on the same host as the Hermes
+# reindex endpoint, so the job posts to loopback and does not join Tailscale.
+# See docs/ci-cd-runners.md. synaptic-voice-studio is replaced by wire_repo_ci.
+name: Hermes reindex
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: hermes-reindex-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  reindex:
+    runs-on: [self-hosted, ARM64, synaptic-voice-studio-reindex]
+    timeout-minutes: 5
+    steps:
+      - name: Notify Hermes
+        env:
+          HERMES_REINDEX_URL: ${{ secrets.HERMES_REINDEX_URL }}
+          HERMES_REINDEX_TOKEN: ${{ secrets.HERMES_REINDEX_TOKEN }}
+          HERMES_PROJECT_SLUG: ${{ vars.HERMES_PROJECT_SLUG }}
+        run: |
+          set -euo pipefail
+          test -n "$HERMES_REINDEX_URL" && test -n "$HERMES_REINDEX_TOKEN" && test -n "$HERMES_PROJECT_SLUG"
+          curl --fail --show-error --silent \
+            --connect-timeout 10 --max-time 120 \
+            --retry 2 --retry-connrefused \
+            -X POST "$HERMES_REINDEX_URL" \
+            -H "X-Hermes-Reindex-Token: $HERMES_REINDEX_TOKEN" \
+            -H 'content-type: application/json' \
+            --data "{\"slug\":\"${HERMES_PROJECT_SLUG}\",\"sha\":\"${GITHUB_SHA}\"}"
