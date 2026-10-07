@@ -33,7 +33,7 @@ done
 git ls-files 2>/dev/null | grep -qE '\.env\..*\.vps$' && err "tracked .env.*.vps secret"
 
 # 5. An env template is committed.
-ls .env.example .env.*.example >/dev/null 2>&1 || err ".env.example (or .env.<svc>.example) missing"
+[ -s .env.example ] || err ".env.example missing/empty"
 
 # 6. Required docs present and non-empty.
 for d in README.md docs/ARCHITECTURE.md docs/RUNBOOK.md; do
