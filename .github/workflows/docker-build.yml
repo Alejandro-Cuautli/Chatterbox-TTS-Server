@@ -19,6 +19,7 @@ jobs:
 
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           # NVIDIA CUDA 12.1
@@ -26,44 +27,47 @@ jobs:
             tag-suffix: nvidia
             platforms: linux/amd64
             build-args: RUNTIME=nvidia
-            runner: ubuntu-latest
+            runner: [self-hosted, X64, synaptic-voice-studio]
 
           # NVIDIA CUDA 12.8 Blackwell
           - dockerfile: Dockerfile.cu128
             tag-suffix: cu128
             platforms: linux/amd64
             build-args: RUNTIME=nvidia
-            runner: ubuntu-latest
+            runner: [self-hosted, X64, synaptic-voice-studio]
 
           # NVIDIA CUDA 13.0 Blackwell sm121 (ARM64)
           - dockerfile: Dockerfile.cu130
             tag-suffix: cu130
             platforms: linux/arm64
             build-args: RUNTIME=nvidia
-            runner: ubuntu-24.04-arm
+            runner: [self-hosted, ARM64, synaptic-voice-studio]
 
           # AMD ROCm
           - dockerfile: Dockerfile.rocm
             tag-suffix: rocm
             platforms: linux/amd64
             build-args: ""
-            runner: ubuntu-latest
+            runner: [self-hosted, X64, synaptic-voice-studio]
 
           # AMD Strix Halo ROCm
           - dockerfile: Dockerfile.strixhalo
             tag-suffix: strixhalo
             platforms: linux/amd64
             build-args: ""
-            runner: ubuntu-latest
+            runner: [self-hosted, X64, synaptic-voice-studio]
 
           # CPU only
           - dockerfile: Dockerfile.cpu
             tag-suffix: cpu
             platforms: linux/amd64
             build-args: ""
-            runner: ubuntu-latest
+            runner: [self-hosted, X64, synaptic-voice-studio]
 
+    # Native architectures only. amd64 listeners share one admission queue on
+    # the rootless vps_05 build-farm; no hosted fallback or QEMU.
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
