@@ -1,21 +1,32 @@
-# Hermes Project Contract gate — runs the portable self-check on every PR.
-# Make this a required status check in branch protection to BLOCK drift (Fase 2).
+# Hermes Project Contract gate — el self-check portable en cada PR.
+# `contract` es un check requerido (.hermes/delivery.json): no lleva filtro de rutas
+# a propósito (un workflow filtrado no reporta y el check se queda Pending), y dura
+# segundos.
+# ci-audit: sin-filtro-de-rutas: check requerido de segundos; filtrarlo lo dejaría Pending
+#
+# Solo pull_request (+ a mano): el antiguo `push: branches-ignore: [main]` lanzaba un
+# segundo run por push en otro grupo de concurrency y ocupaba el único runner del repo.
 name: Contract
 
 on:
   pull_request:
     branches: [main]
-  push:
-    branches-ignore: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: contract-${{ github.ref }}
-  cancel-in-progress: true
+  group: contract-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   contract:
     runs-on: [self-hosted, ARM64, synaptic-voice-studio]
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Hermes Project Contract self-check
         run: bash .hermes/contract-check.sh
