@@ -7,8 +7,7 @@
 # Las imágenes GPU viven en docker-build.yml (solo main, tags, nightly y a mano).
 #
 #   - carril rápido (cada PR, presupuesto 5 min con la cola): lint, tests y build;
-#   - carril pesado (`image`): solo en main, nightly, a mano y en las PR que tocan de
-#     qué está hecha la imagen (Dockerfile, requirements, .github/, toolchain).
+#   - carril pesado (imágenes): en docker-build.yml, solo main, tags, nightly y a mano.
 # Ninguna compuerta se quita: el carril pesado cambia de momento, no desaparece.
 #
 # Disparadores: SOLO pull_request (+ push a main, nightly y a mano). El antiguo
@@ -19,8 +18,7 @@
 # Nunca `paths:` a nivel de workflow: `ci-result` es un check requerido y un workflow
 # filtrado no lo reporta (se queda Pending). El filtro es el job `changes`.
 #
-# Rollback sin commit: variable del repo HERMES_CI_FORCE_HEAVY=true (carril pesado en
-# todas las PR). Rollback completo: revert del merge.
+# Rollback: revert del merge. (HERMES_CI_FORCE_HEAVY=true fuerza `heavy`, hoy sin job en PR.)
 name: CI
 
 on:
@@ -115,32 +113,16 @@ jobs:
             pytest -q tests
           fi
 
-  # Carril pesado: smoke de la imagen CPU (sin publicar, nunca las GPU) solo cuando
-  # cambia de qué está hecha, en main, en el nightly y a mano. Las seis imágenes
-  # (GPU incluidas) se construyen y publican en docker-build.yml, fuera de la PR.
-  image:
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true'
-    runs-on: [self-hosted, ARM64, synaptic-voice-studio]
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Lint de los Dockerfile (sin construir)
-        run: |
-          set -euo pipefail
-          for f in Dockerfile*; do
-            echo "== $f"
-            docker build --check -f "$f" .
-          done
+  # Carril pesado: en este repo NO hay job de imagen en la PR. El build CPU instala torch
+  # y compila onnx/tokenizers (>45 min en ARM64) y los Dockerfile GPU parten de bases
+  # amd64 enormes; las seis imágenes se construyen y publican en docker-build.yml
+  # (main, tags, nightly y a mano). `heavy` queda calculado por si se añade un carril.
 
   # Único check requerido de CI (con `contract`, .hermes/delivery.json). Un gate omitido
-  # cuenta como fallo, salvo `test` cuando la PR solo trae .md e `image` fuera del
-  # carril pesado.
+  # cuenta como fallo, salvo `test` cuando la PR solo trae .md.
   ci-result:
     if: always()
-    needs: [changes, test, image]
+    needs: [changes, test]
     runs-on: [self-hosted, ARM64, synaptic-voice-studio]
     timeout-minutes: 5
     permissions:
@@ -151,16 +133,14 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           CODE: ${{ needs.changes.outputs.code }}
-          HEAVY: ${{ needs.changes.outputs.heavy }}
         run: |
           set -euo pipefail
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key)=\(.value.result)"'
-          bad=$(echo "$NEEDS" | jq -r --arg code "$CODE" --arg heavy "$HEAVY" '
+          bad=$(echo "$NEEDS" | jq -r --arg code "$CODE" '
             to_entries[] | .key as $k | .value.result as $r
             | select(($r == "failure" or $r == "cancelled")
                      or ($r == "skipped" and ($k == "changes"
-                                              or ($k == "test" and $code == "true")
-                                              or ($k == "image" and $heavy == "true"))))
+                                              or ($k == "test" and $code == "true"))))
             | "\($k): \($r)"')
           if [ -n "$bad" ]; then
             echo "::error::gates not satisfied: $(echo $bad)"
