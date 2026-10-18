@@ -1,52 +1,186 @@
-# Hermes CI — runs on every PR, BEFORE merge to main.
-# This is the second test gate (the first runs inside the agent loop on the
-# worktree). Copy into each project repo as .github/workflows/ci.yml.
+# Hermes CI — carril rápido de PR + carril pesado (estándar «CI de la fábrica»,
+# synaptic-catalog ci/ESTANDAR-CI-FABRICA.md; piloto: incu-bot docs/ci/carriles.md).
 #
-# Auto-detects Node (package.json) and/or Python (pyproject.toml/requirements.txt)
-# and runs lint + test + build. Adjust the commands per project as needed.
+# Es la segunda puerta de pruebas. Este repo es Python (servidor TTS con torch fijado):
+# el carril rápido NO instala torch ni requirements.txt; hace ruff (errores de sintaxis
+# y nombres sin definir) y compileall. No hay suite de tests; si aparece `tests/`, corre.
+# Las imágenes GPU viven en docker-build.yml (solo main, tags, nightly y a mano).
+#
+#   - carril rápido (cada PR, presupuesto 5 min con la cola): lint, tests y build;
+#   - carril pesado (`image`): solo en main, nightly, a mano y en las PR que tocan de
+#     qué está hecha la imagen (Dockerfile, requirements, .github/, toolchain).
+# Ninguna compuerta se quita: el carril pesado cambia de momento, no desaparece.
+#
+# Disparadores: SOLO pull_request (+ push a main, nightly y a mano). El antiguo
+# `push: branches-ignore: [main]` lanzaba un segundo run por cada push a una rama con
+# PR, en otro grupo de `concurrency` (refs/heads/x ≠ refs/pull/N/merge), y los dos se
+# peleaban por el único runner del repo.
+#
+# Nunca `paths:` a nivel de workflow: `ci-result` es un check requerido y un workflow
+# filtrado no lo reporta (se queda Pending). El filtro es el job `changes`.
+#
+# Rollback sin commit: variable del repo HERMES_CI_FORCE_HEAVY=true (carril pesado en
+# todas las PR). Rollback completo: revert del merge.
 name: CI
 
 on:
   pull_request:
     branches: [main]
-  # Allow re-running CI on pushes to feature branches too.
   push:
-    branches-ignore: [main]
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * *'
 
+permissions:
+  contents: read
+  pull-requests: read
+
+# Una PR = un grupo: un push nuevo cancela el run viejo de esa PR. Main va por commit y
+# no se cancela nunca (un grupo solo guarda un run pendiente: agrupar main por rama
+# dejaría commits sin veredicto).
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || format('{0}-{1}', github.event_name, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
+  # Qué cambia la PR. code=false solo si TODO son .md; heavy=true si toca de qué está
+  # hecha la imagen o el propio CI. Fuera de una PR, todo.
+  changes:
     runs-on: [self-hosted, ARM64, synaptic-voice-studio]
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+      heavy: ${{ steps.classify.outputs.heavy }}
+    steps:
+      - name: Classify the changed files
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          FORCE_HEAVY: ${{ vars.HERMES_CI_FORCE_HEAVY }}
+        run: |
+          set -euo pipefail
+          all() { printf 'code=true\nheavy=true\n' >> "$GITHUB_OUTPUT"; echo "$1: carril completo" | tee -a "$GITHUB_STEP_SUMMARY"; exit 0; }
+          [ "${GITHUB_EVENT_NAME}" = "pull_request" ] || all "${GITHUB_EVENT_NAME}"
+          [ "${FORCE_HEAVY:-}" != "true" ] || all "HERMES_CI_FORCE_HEAVY=true"
+          # Un rename deja la ruta vieja en previous_filename: se clasifican las dos.
+          files=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)')
+          count=$(printf '%s\n' "$files" | grep -c . || true)
+          # La API corta en 3000 ficheros: a partir de ahí no se adivina.
+          if [ "$count" -eq 0 ] || [ "$count" -ge 3000 ]; then all "${count} ficheros"; fi
+          code=false heavy=false
+          while IFS= read -r f; do
+            case "$f" in
+              *.md) ;;
+              *) code=true ;;
+            esac
+            case "$f" in
+              *Dockerfile*|*.dockerignore|docker-compose*.yml|compose*.yml \
+              |package.json|*/package.json|package-lock.json|*/package-lock.json|pnpm-lock.yaml|yarn.lock \
+              |requirements*.txt|*/requirements*.txt|pyproject.toml|*/pyproject.toml|poetry.lock|uv.lock \
+              |.nvmrc|.node-version|.python-version|.tool-versions|.github/*)
+                [ "$heavy" = true ] || echo "carril pesado: $f"; heavy=true ;;
+            esac
+          done <<< "$files"
+          printf 'code=%s\nheavy=%s\n' "$code" "$heavy" >> "$GITHUB_OUTPUT"
+          echo "code=$code heavy=$heavy ($count ficheros)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: [self-hosted, ARM64, synaptic-voice-studio]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
-      # ---- Node ----
-      - name: Setup Node
-        if: ${{ hashFiles('package.json') != '' }}
-        uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
-      - name: Node install + lint + test + build
-        if: ${{ hashFiles('package.json') != '' }}
-        run: |
-          npm ci
-          npm run lint --if-present
-          npm test --if-present
-          npm run build --if-present
+          persist-credentials: false
 
-      # ---- Python ----
-      - name: Python install + test
-        if: ${{ hashFiles('pyproject.toml', 'requirements.txt') != '' }}
+      - name: Lint (ruff) + compileall + tests si existen
         run: |
-          python3 -m venv .venv-ci
-          . .venv-ci/bin/activate
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f pyproject.toml ]; then pip install -e .; fi
-          pip install ruff pytest
-          ruff check .
-          pytest -q
+          set -euo pipefail
+          PIP_CACHE_DIR="$(bash .github/ci/local-cache.sh dir pip)"
+          export PIP_CACHE_DIR
+          venv="$RUNNER_TEMP/venv-ci"
+          python3 -m venv "$venv"
+          . "$venv/bin/activate"
+          pip install --quiet ruff
+          # Solo errores reales (sintaxis, nombres sin definir): el árbol heredado del
+          # upstream tiene cientos de avisos de estilo que no son de esta puerta.
+          ruff check --no-cache --select E9,F63,F7,F82 .
+          python -m compileall -q -x '(^|/)(\.git|\.venv[^/]*)(/|$)' .
+          if [ -d tests ]; then
+            pip install --quiet -r requirements.txt pytest
+            pytest -q tests
+          fi
+
+  # Carril pesado: smoke de la imagen CPU (sin publicar, nunca las GPU) solo cuando
+  # cambia de qué está hecha, en main, en el nightly y a mano. Las seis imágenes
+  # (GPU incluidas) se construyen y publican en docker-build.yml, fuera de la PR.
+  image:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: [self-hosted, ARM64, synaptic-voice-studio]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Smoke de la imagen CPU (sin publicar)
+        if: ${{ hashFiles('Dockerfile.cpu') != '' }}
+        run: |
+          set -euo pipefail
+          tag=$(echo "ci-${GITHUB_REPOSITORY##*/}:${GITHUB_RUN_ID}" | tr '[:upper:]' '[:lower:]')
+          trap 'docker image rm -f "$tag" >/dev/null 2>&1 || true' EXIT
+          docker build --pull -f Dockerfile.cpu -t "$tag" .
+
+  # Único check requerido de CI (con `contract`, .hermes/delivery.json). Un gate omitido
+  # cuenta como fallo, salvo `test` cuando la PR solo trae .md e `image` fuera del
+  # carril pesado.
+  ci-result:
+    if: always()
+    needs: [changes, test, image]
+    runs-on: [self-hosted, ARM64, synaptic-voice-studio]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Require every gate
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          CODE: ${{ needs.changes.outputs.code }}
+          HEAVY: ${{ needs.changes.outputs.heavy }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key)=\(.value.result)"'
+          bad=$(echo "$NEEDS" | jq -r --arg code "$CODE" --arg heavy "$HEAVY" '
+            to_entries[] | .key as $k | .value.result as $r
+            | select(($r == "failure" or $r == "cancelled")
+                     or ($r == "skipped" and ($k == "changes"
+                                              or ($k == "test" and $code == "true")
+                                              or ($k == "image" and $heavy == "true"))))
+            | "\($k): \($r)"')
+          if [ -n "$bad" ]; then
+            echo "::error::gates not satisfied: $(echo $bad)"
+            exit 1
+          fi
+
+      # Regla 1: 5 min desde que se crea el run, cola incluida. Avisa; no falla.
+      - name: Fast-lane budget
+        if: always() && github.event_name == 'pull_request' && needs.changes.outputs.heavy != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUDGET_SECONDS: ${{ vars.HERMES_CI_FAST_BUDGET_SECONDS || '300' }}
+        run: |
+          created=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq .created_at)
+          elapsed=$(( $(date +%s) - $(date -d "$created" +%s) ))
+          line="carril rápido: ${elapsed}s de ${BUDGET_SECONDS}s (cola incluida)"
+          echo "- ${line}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$elapsed" -gt "$BUDGET_SECONDS" ]; then
+            echo "::warning::${line} — fuera de presupuesto: justifícalo en la PR u optimízalo"
+          else
+            echo "$line"
+          fi
