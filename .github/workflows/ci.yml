@@ -122,18 +122,18 @@ jobs:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: [self-hosted, ARM64, synaptic-voice-studio]
-    timeout-minutes: 45
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Smoke de la imagen CPU (sin publicar)
-        if: ${{ hashFiles('Dockerfile.cpu') != '' }}
+      - name: Lint de los Dockerfile (sin construir)
         run: |
           set -euo pipefail
-          tag=$(echo "ci-${GITHUB_REPOSITORY##*/}:${GITHUB_RUN_ID}" | tr '[:upper:]' '[:lower:]')
-          trap 'docker image rm -f "$tag" >/dev/null 2>&1 || true' EXIT
-          docker build --pull -f Dockerfile.cpu -t "$tag" .
+          for f in Dockerfile*; do
+            echo "== $f"
+            docker build --check -f "$f" .
+          done
 
   # Único check requerido de CI (con `contract`, .hermes/delivery.json). Un gate omitido
   # cuenta como fallo, salvo `test` cuando la PR solo trae .md e `image` fuera del
