@@ -3,74 +3,69 @@
 # Handles API requests for text-to-speech generation, UI serving,
 # configuration management, and file uploads.
 
-import os
-import io
 import asyncio
-import struct
+import io
 import logging
 import logging.handlers  # For RotatingFileHandler
 import shutil
-import time
-import uuid
-import yaml  # For loading presets
-import numpy as np
-import librosa  # For potential direct use if needed, though utils.py handles most
-from pathlib import Path
-from contextlib import asynccontextmanager
-from typing import Optional, List, Dict, Any, Literal
-import webbrowser  # For automatic browser opening
+import struct
 import threading  # For automatic browser opening
+import time
+import webbrowser  # For automatic browser opening
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Annotated, BinaryIO, Literal
 
+import numpy as np
+import yaml  # For loading presets
 from fastapi import (
+    BackgroundTasks,
     FastAPI,
+    File,
     HTTPException,
     Request,
-    File,
     UploadFile,
-    Form,
-    BackgroundTasks,
 )
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     StreamingResponse,
-    FileResponse,
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+import engine  # TTS Engine interface
+import utils  # Utility functions
 
 # --- Internal Project Imports ---
 from config import (
     config_manager,
-    get_host,
-    get_port,
-    get_ssl_config,
-    get_log_file_path,
-    get_output_path,
-    get_reference_audio_path,
-    get_predefined_voices_path,
-    get_ui_title,
-    get_gen_default_temperature,
-    get_gen_default_exaggeration,
-    get_gen_default_cfg_weight,
-    get_gen_default_seed,
-    get_gen_default_speed_factor,
-    get_gen_default_language,
+    get_audio_output_format,
     get_audio_sample_rate,
     get_full_config_for_template,
-    get_audio_output_format,
+    get_gen_default_cfg_weight,
+    get_gen_default_exaggeration,
+    get_gen_default_language,
+    get_gen_default_seed,
+    get_gen_default_speed_factor,
+    get_gen_default_temperature,
+    get_host,
+    get_log_file_path,
+    get_output_path,
+    get_port,
+    get_predefined_voices_path,
+    get_reference_audio_path,
+    get_ssl_config,
+    get_ui_title,
 )
-
-import engine  # TTS Engine interface
 from models import (  # Pydantic models
     CustomTTSRequest,
     ErrorResponse,
     UpdateStatusResponse,
 )
-import utils  # Utility functions
-
-from pydantic import BaseModel, Field
 
 # Serializa el acceso real al modelo cargado (un solo modelo en memoria, MPS/CUDA).
 # `run_in_executor(None, ...)` usa el ThreadPoolExecutor por defecto, que tiene
@@ -85,8 +80,8 @@ class OpenAISpeechRequest(BaseModel):
     voice: str
     response_format: Literal["wav", "opus", "mp3"] = "wav"  # Add "mp3"
     speed: float = 1.0
-    seed: Optional[int] = None
-    language: Optional[str] = None
+    seed: int | None = None
+    language: str | None = None
 
 
 # --- Logging Configuration ---
@@ -118,6 +113,12 @@ logger = logging.getLogger(__name__)
 startup_complete_event = threading.Event()  # For coordinating browser opening
 
 
+def _copy_uploaded_stream(source: BinaryIO, destination: Path) -> None:
+    """Copy uploads off the event loop while retaining streaming memory usage."""
+    with destination.open("wb") as target:
+        shutil.copyfileobj(source, target)
+
+
 def _delayed_browser_open(host: str, port: int):
     """
     Waits for the startup_complete_event, then opens the web browser
@@ -136,8 +137,8 @@ def _delayed_browser_open(host: str, port: int):
         browser_url = f"http://{display_host}:{port}/"
         logger.info(f"Attempting to open web browser to: {browser_url}")
         webbrowser.open(browser_url)
-    except Exception as e:
-        logger.error(f"Failed to open browser automatically: {e}", exc_info=True)
+    except Exception:
+        logger.exception('Failed to open browser automatically: ')
 
 
 @asynccontextmanager
@@ -176,9 +177,9 @@ async def lifespan(app: FastAPI):
         logger.info("Application startup sequence complete.")
         startup_complete_event.set()
         yield
-    except Exception as e_startup:
-        logger.error(
-            f"FATAL ERROR during application startup: {e_startup}", exc_info=True
+    except Exception:
+        logger.exception(
+            'FATAL ERROR during application startup: '
         )
         startup_complete_event.set()
         yield
@@ -390,8 +391,8 @@ def _remove_dc_offset(
             "Install scipy to enable this feature: pip install scipy"
         )
         return audio.astype(np.float32, copy=False)
-    except Exception as e:
-        logger.error(f"DC offset removal failed: {e}")
+    except Exception:
+        logger.exception('DC offset removal failed: ')
         return audio.astype(np.float32, copy=False)
 
 
@@ -424,8 +425,8 @@ async def get_web_ui(request: Request):
     logger.info("Request received for main UI page ('/').")
     try:
         return templates.TemplateResponse("index.html", {"request": request})
-    except Exception as e_render:
-        logger.error(f"Error rendering main UI page: {e_render}", exc_info=True)
+    except Exception:
+        logger.exception('Error rendering main UI page: ')
         return HTMLResponse(
             "<html><body><h1>Internal Server Error</h1><p>Could not load the TTS interface. "
             "Please check server logs for more details.</p></body></html>",
@@ -445,8 +446,8 @@ async def get_model_info_endpoint():
     try:
         model_info = engine.get_model_info()
         return model_info
-    except Exception as e:
-        logger.error(f"Error getting model info: {e}", exc_info=True)
+    except Exception:
+        logger.exception('Error getting model info: ')
         raise HTTPException(
             status_code=500, detail="Failed to retrieve model information"
         )
@@ -471,14 +472,13 @@ async def get_ui_initial_data():
         loaded_presets = []
         presets_file = ui_static_path / "presets.yaml"
         if presets_file.exists():
-            with open(presets_file, "r", encoding="utf-8") as f:
-                yaml_content = yaml.safe_load(f)
-                if isinstance(yaml_content, list):
-                    loaded_presets = yaml_content
-                else:
-                    logger.warning(
-                        f"Invalid format in {presets_file}. Expected a list, got {type(yaml_content)}."
-                    )
+            yaml_content = yaml.safe_load(await asyncio.to_thread(presets_file.read_text, encoding="utf-8"))
+            if isinstance(yaml_content, list):
+                loaded_presets = yaml_content
+            else:
+                logger.warning(
+                    f"Invalid format in {presets_file}. Expected a list, got {type(yaml_content)}."
+                )
         else:
             logger.info(
                 f"Presets file not found: {presets_file}. No presets will be loaded for initial data."
@@ -501,8 +501,8 @@ async def get_ui_initial_data():
             "initial_gen_result": initial_gen_result_placeholder,
             "model_info": model_info,  # NEW: Include model information
         }
-    except Exception as e:
-        logger.error(f"Error preparing initial UI data for API: {e}", exc_info=True)
+    except Exception:
+        logger.exception('Error preparing initial UI data for API: ')
         raise HTTPException(
             status_code=500, detail="Failed to load initial data for UI."
         )
@@ -519,7 +519,7 @@ async def save_settings_endpoint(request: Request):
     try:
         partial_update = await request.json()
         if not isinstance(partial_update, dict):
-            raise ValueError("Request body must be a JSON object for /save_settings.")
+            raise TypeError("Request body must be a JSON object for /save_settings.")
         logger.debug(f"Received partial config data to save: {partial_update}")
 
         if config_manager.update_and_save(partial_update):
@@ -541,12 +541,12 @@ async def save_settings_endpoint(request: Request):
             )
     except ValueError as ve:
         logger.error(f"Invalid data format for /save_settings: {ve}")
-        raise HTTPException(status_code=400, detail=f"Invalid request data: {str(ve)}")
+        raise HTTPException(status_code=400, detail=f"Invalid request data: {ve!s}")
     except Exception as e:
-        logger.error(f"Error processing /save_settings request: {e}", exc_info=True)
+        logger.exception('Error processing /save_settings request: ')
         raise HTTPException(
             status_code=500,
-            detail=f"Internal server error during settings save: {str(e)}",
+            detail=f"Internal server error during settings save: {e!s}",
         )
 
 
@@ -569,10 +569,10 @@ async def reset_settings_endpoint():
                 status_code=500, detail="Failed to reset and save configuration file."
             )
     except Exception as e:
-        logger.error(f"Error processing /reset_settings request: {e}", exc_info=True)
+        logger.exception('Error processing /reset_settings request: ')
         raise HTTPException(
             status_code=500,
-            detail=f"Internal server error during settings reset: {str(e)}",
+            detail=f"Internal server error during settings reset: {e!s}",
         )
 
 
@@ -607,10 +607,10 @@ async def restart_server_endpoint():
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Critical error during model hot-swap: {e}", exc_info=True)
+        logger.exception('Critical error during model hot-swap: ')
         raise HTTPException(
             status_code=500,
-            detail=f"Internal server error during model reload: {str(e)}",
+            detail=f"Internal server error during model reload: {e!s}",
         )
 
 
@@ -636,37 +636,37 @@ async def unload_model_endpoint():
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Critical error during model unload: {e}", exc_info=True)
+        logger.exception('Critical error during model unload: ')
         raise HTTPException(
             status_code=500,
-            detail=f"Internal server error during model unload: {str(e)}",
+            detail=f"Internal server error during model unload: {e!s}",
         )
 
 
 # --- UI Helper API Endpoints ---
-@app.get("/get_reference_files", response_model=List[str], tags=["UI Helpers"])
+@app.get("/get_reference_files", response_model=list[str], tags=["UI Helpers"])
 async def get_reference_files_api():
     """Returns a list of valid reference audio filenames (.wav, .mp3)."""
     logger.debug("Request for /get_reference_files.")
     try:
         return utils.get_valid_reference_files()
-    except Exception as e:
-        logger.error(f"Error getting reference files for API: {e}", exc_info=True)
+    except Exception:
+        logger.exception('Error getting reference files for API: ')
         raise HTTPException(
             status_code=500, detail="Failed to retrieve reference audio files."
         )
 
 
 @app.get(
-    "/get_predefined_voices", response_model=List[Dict[str, str]], tags=["UI Helpers"]
+    "/get_predefined_voices", response_model=list[dict[str, str]], tags=["UI Helpers"]
 )
 async def get_predefined_voices_api():
     """Returns a list of predefined voices with display names and filenames."""
     logger.debug("Request for /get_predefined_voices.")
     try:
         return utils.get_predefined_voices()
-    except Exception as e:
-        logger.error(f"Error getting predefined voices for API: {e}", exc_info=True)
+    except Exception:
+        logger.exception('Error getting predefined voices for API: ')
         raise HTTPException(
             status_code=500, detail="Failed to retrieve predefined voices list."
         )
@@ -674,15 +674,15 @@ async def get_predefined_voices_api():
 
 # --- File Upload Endpoints ---
 @app.post("/upload_reference", tags=["File Management"])
-async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
+async def upload_reference_audio_endpoint(files: Annotated[list[UploadFile], File(...)]):
     """
     Handles uploading of reference audio files (.wav, .mp3) for voice cloning.
     Validates files and saves them to the configured reference audio path.
     """
     logger.info(f"Request to /upload_reference with {len(files)} file(s).")
     ref_path = get_reference_audio_path(ensure_absolute=True)
-    uploaded_filenames_successfully: List[str] = []
-    upload_errors: List[Dict[str, str]] = []
+    uploaded_filenames_successfully: list[str] = []
+    upload_errors: list[dict[str, str]] = []
 
     for file in files:
         if not file.filename:
@@ -710,8 +710,7 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
                     uploaded_filenames_successfully.append(safe_filename)
                 continue
 
-            with open(destination_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+            await asyncio.to_thread(_copy_uploaded_stream, file.file, destination_path)
             logger.info(
                 f"Successfully saved uploaded reference file to: {destination_path}"
             )
@@ -734,8 +733,8 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
                 uploaded_filenames_successfully.append(safe_filename)
 
         except Exception as e_upload:
-            error_msg = f"Error processing file '{file.filename}': {str(e_upload)}"
-            logger.error(error_msg, exc_info=True)
+            error_msg = f"Error processing file '{file.filename}': {e_upload!s}"
+            logger.exception(error_msg)
             upload_errors.append({"filename": file.filename, "error": str(e_upload)})
         finally:
             await file.close()
@@ -758,15 +757,15 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
 
 
 @app.post("/upload_predefined_voice", tags=["File Management"])
-async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
+async def upload_predefined_voice_endpoint(files: Annotated[list[UploadFile], File(...)]):
     """
     Handles uploading of predefined voice files (.wav, .mp3).
     Validates files and saves them to the configured predefined voices path.
     """
     logger.info(f"Request to /upload_predefined_voice with {len(files)} file(s).")
     predefined_voices_path = get_predefined_voices_path(ensure_absolute=True)
-    uploaded_filenames_successfully: List[str] = []
-    upload_errors: List[Dict[str, str]] = []
+    uploaded_filenames_successfully: list[str] = []
+    upload_errors: list[dict[str, str]] = []
 
     for file in files:
         if not file.filename:
@@ -796,8 +795,7 @@ async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
                     uploaded_filenames_successfully.append(safe_filename)
                 continue
 
-            with open(destination_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+            await asyncio.to_thread(_copy_uploaded_stream, file.file, destination_path)
             logger.info(
                 f"Successfully saved uploaded predefined voice file to: {destination_path}"
             )
@@ -817,8 +815,8 @@ async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
                 uploaded_filenames_successfully.append(safe_filename)
 
         except Exception as e_upload:
-            error_msg = f"Error processing predefined voice file '{file.filename}': {str(e_upload)}"
-            logger.error(error_msg, exc_info=True)
+            error_msg = f"Error processing predefined voice file '{file.filename}': {e_upload!s}"
+            logger.exception(error_msg)
             upload_errors.append({"filename": file.filename, "error": str(e_upload)})
         finally:
             await file.close()
@@ -900,7 +898,7 @@ async def custom_tts_endpoint(
     )
     logger.debug(f"Input text (first 100 chars): '{request.text[:100]}...'")
 
-    audio_prompt_path_for_engine: Optional[Path] = None
+    audio_prompt_path_for_engine: Path | None = None
     if request.voice_mode == "predefined":
         if not request.predefined_voice_id:
             raise HTTPException(
@@ -953,11 +951,11 @@ async def custom_tts_endpoint(
 
     perf_monitor.record("Parameters and voice path resolved")
 
-    all_audio_segments_np: List[np.ndarray] = []
+    all_audio_segments_np: list[np.ndarray] = []
     final_output_sample_rate = (
         get_audio_sample_rate()
     )  # Target SR for the final output file
-    engine_output_sample_rate: Optional[int] = (
+    engine_output_sample_rate: int | None = (
         None  # SR from the TTS engine (e.g., 24000 Hz)
     )
 
@@ -1014,7 +1012,7 @@ async def custom_tts_endpoint(
 
         async def _stream_generator():
             loop = asyncio.get_running_loop()
-            carry: Optional[np.ndarray] = None
+            carry: np.ndarray | None = None
             header_sent = False
 
             for i, chunk_text in enumerate(text_chunks):
@@ -1163,11 +1161,11 @@ async def custom_tts_endpoint(
                 processed_audio_np = current_processed_audio_tensor.cpu().numpy().squeeze()
                 all_audio_segments_np.append(processed_audio_np)
 
-            except HTTPException as http_exc:
-                raise http_exc
+            except HTTPException:
+                raise
             except Exception as e_chunk:
-                error_detail = f"Error processing audio chunk {i+1}: {str(e_chunk)}"
-                logger.error(error_detail, exc_info=True)
+                error_detail = f"Error processing audio chunk {i+1}: {e_chunk!s}"
+                logger.exception(error_detail)
                 raise HTTPException(status_code=500, detail=error_detail)
 
         if not all_audio_segments_np:
@@ -1327,7 +1325,7 @@ async def custom_tts_endpoint(
             # ### SMART AUDIO STITCHING END ###
 
         except ValueError as e_concat:
-            logger.error(f"Audio concatenation/stitching failed: {e_concat}", exc_info=True)
+            logger.exception('Audio concatenation/stitching failed: ')
             for idx, seg in enumerate(all_audio_segments_np):
                 logger.error(f"Segment {idx} shape: {seg.shape}, dtype: {seg.dtype}")
             raise HTTPException(
@@ -1383,8 +1381,7 @@ async def custom_tts_endpoint(
         output_file_path = output_dir / download_filename
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
-            with open(output_file_path, "wb") as f:
-                f.write(encoded_audio_bytes)
+            await asyncio.to_thread(output_file_path.write_bytes, encoded_audio_bytes)
             if not output_file_path.exists() or output_file_path.stat().st_size < 100:
                 logger.error(f"File save verification failed for {output_file_path}")
                 raise HTTPException(
@@ -1395,8 +1392,8 @@ async def custom_tts_endpoint(
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(
-                f"Failed to save audio to {output_file_path}: {e}", exc_info=True
+            logger.exception(
+                f'Failed to save audio to {output_file_path}: '
             )
             raise HTTPException(
                 status_code=500, detail=f"Failed to save audio file: {e}"
@@ -1412,8 +1409,8 @@ async def openai_voices_endpoint(model: str = ""):
     logger.debug("Request for /v1/audio/voices.")
     try:
         return {"status": "ok", "voices": [voice["filename"] for voice in utils.get_predefined_voices()]}
-    except Exception as e:
-        logger.error(f"Error getting predefined voices for API: {e}", exc_info=True)
+    except Exception:
+        logger.exception('Error getting predefined voices for API: ')
         raise HTTPException(
             status_code=500, detail="Failed to retrieve predefined voices list."
         )
@@ -1467,8 +1464,8 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
                 f"OpenAI speech: processing {len(text_chunks)} chunk(s) for input of {len(request.input_)} chars"
             )
 
-            all_audio_segments_np: List[np.ndarray] = []
-            engine_sr: Optional[int] = None
+            all_audio_segments_np: list[np.ndarray] = []
+            engine_sr: int | None = None
 
             for i, chunk_text in enumerate(text_chunks):
                 chunk_seed = seed_to_use + i if seed_to_use is not None and seed_to_use >= 0 else seed_to_use
@@ -1563,8 +1560,8 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
                 except HTTPException:
                     raise
                 except Exception as e:
-                    logger.error(
-                        f"Failed to save audio to {output_file_path}: {e}", exc_info=True
+                    logger.exception(
+                        f'Failed to save audio to {output_file_path}: '
                     )
                     raise HTTPException(
                         status_code=500, detail=f"Failed to save audio file: {e}"
@@ -1579,7 +1576,7 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         return response
 
     except Exception as e:
-        logger.error(f"Error in openai_speech_endpoint: {e}", exc_info=True)
+        logger.exception('Error in openai_speech_endpoint: ')
         raise HTTPException(status_code=500, detail=str(e))
 
 

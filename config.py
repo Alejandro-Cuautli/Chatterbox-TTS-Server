@@ -2,15 +2,16 @@
 # Manages application configuration using a YAML file (config.yaml).
 # Handles loading, saving, and providing access to configuration settings.
 
-import os
 import logging
-import yaml
+import os
 import shutil
 from copy import deepcopy
-from threading import Lock
-from typing import Dict, Any, Optional, List, Tuple
-import torch  # For automatic CUDA/CPU device detection
 from pathlib import Path
+from threading import Lock
+from typing import Any
+
+import torch  # For automatic CUDA/CPU device detection
+import yaml
 
 # Standard logger setup
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ DEFAULT_OUTPUT_PATH = Path("./outputs")  # For server-saved audio outputs (if an
 # This dictionary defines the complete expected structure of 'config.yaml',
 # including default values for all settings. It serves as the template for
 # creating a new config.yaml if one does not exist.
-DEFAULT_CONFIG: Dict[str, Any] = {
+DEFAULT_CONFIG: dict[str, Any] = {
     "server": {
         "host": "0.0.0.0",  # Host address for the server to listen on.
         "port": 8000,  # Port number for the server.
@@ -126,11 +127,11 @@ def _ensure_default_paths_exist():
     for path in paths_to_check:
         try:
             path.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            logger.error(f"Error creating default directory {path}: {e}", exc_info=True)
+        except Exception:
+            logger.exception(f'Error creating default directory {path}: ')
 
 
-def _deep_merge_dicts(source: Dict, destination: Dict) -> Dict:
+def _deep_merge_dicts(source: dict, destination: dict) -> dict:
     """
     Recursively merges the 'source' dictionary into the 'destination' dictionary.
     Keys from 'source' will overwrite existing keys in 'destination'.
@@ -151,14 +152,14 @@ def _deep_merge_dicts(source: Dict, destination: Dict) -> Dict:
     return destination
 
 
-def _set_nested_value(d: Dict, keys: List[str], value: Any):
+def _set_nested_value(d: dict, keys: list[str], value: Any):
     """Helper function to set a value in a nested dictionary using a list of keys."""
     for key in keys[:-1]:
         d = d.setdefault(key, {})
     d[keys[-1]] = value
 
 
-def _get_nested_value(d: Dict, keys: List[str], default: Any = None) -> Any:
+def _get_nested_value(d: dict, keys: list[str], default: Any = None) -> Any:
     """Helper function to get a value from a nested dictionary using a list of keys."""
     for key in keys:
         if isinstance(d, dict) and key in d:
@@ -177,11 +178,11 @@ class YamlConfigManager:
 
     def __init__(self):
         """Initializes the configuration manager by loading the configuration from YAML."""
-        self.config: Dict[str, Any] = {}
+        self.config: dict[str, Any] = {}
         self._lock = Lock()  # Ensures thread-safety for file write operations.
         self.load_config()
 
-    def _load_defaults(self) -> Dict[str, Any]:
+    def _load_defaults(self) -> dict[str, Any]:
         """
         Returns a deep copy of the hardcoded default configuration structure.
         Also ensures that default directory paths defined in the structure exist.
@@ -189,7 +190,7 @@ class YamlConfigManager:
         _ensure_default_paths_exist()  # Create necessary default directories.
         return deepcopy(DEFAULT_CONFIG)
 
-    def _resolve_paths_and_device(self, config_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _resolve_paths_and_device(self, config_data: dict[str, Any]) -> dict[str, Any]:
         """
         Resolves device settings (e.g., 'auto' to 'cuda' or 'cpu') and converts
         string paths in the configuration data to Path objects for internal use.
@@ -250,7 +251,7 @@ class YamlConfigManager:
                 logger.warning(
                     f"CUDA is reported as available but failed functionality test: {e}. "
                     f"This usually means PyTorch was not compiled with CUDA support."
-                )
+                , exc_info=True)
 
         # Test MPS if CUDA is not available or failed
         if torch.backends.mps.is_available():
@@ -265,12 +266,12 @@ class YamlConfigManager:
                 logger.warning(
                     f"MPS is reported as available but failed functionality test: {e}. "
                     f"This usually means PyTorch was not compiled with MPS support."
-                )
+                , exc_info=True)
 
         logger.info("Neither CUDA nor MPS is available or functional. Using CPU.")
         return "cpu"
 
-    def _prepare_config_for_saving(self, config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def _prepare_config_for_saving(self, config_dict: dict[str, Any]) -> dict[str, Any]:
         """
         Prepares a configuration dictionary for YAML serialization by converting
         internal Path objects back to their string representations.
@@ -340,10 +341,9 @@ class YamlConfigManager:
                         logger.error(
                             f"Failed to overwrite corrupted {CONFIG_FILE_PATH} with defaults."
                         )
-                except Exception as e:
-                    logger.error(
-                        f"Unexpected error loading {CONFIG_FILE_PATH}: {e}. Using in-memory defaults.",
-                        exc_info=True,
+                except Exception:
+                    logger.exception(
+                        f'Unexpected error loading {CONFIG_FILE_PATH}: . Using in-memory defaults.',
                     )
                     self.config = base_defaults  # Use defaults, avoid saving on unexpected errors.
             else:
@@ -367,7 +367,7 @@ class YamlConfigManager:
             logger.debug(f"Current configuration loaded and resolved: {self.config}")
             return self.config
 
-    def _save_config_yaml_internal(self, config_dict_to_save: Dict[str, Any]) -> bool:
+    def _save_config_yaml_internal(self, config_dict_to_save: dict[str, Any]) -> bool:
         """
         Internal method to save the provided configuration dictionary to 'config.yaml'.
         It includes a backup and restore mechanism for safety during writes.
@@ -399,7 +399,7 @@ class YamlConfigManager:
                 except Exception as backup_error:
                     logger.debug(
                         f"Could not create backup of {CONFIG_FILE_PATH}: {backup_error}"
-                    )
+                    , exc_info=True)
                     # Non-fatal: proceed with saving even without a backup.
 
             # Replace the config file with the new content.
@@ -412,16 +412,14 @@ class YamlConfigManager:
             logger.info(f"Configuration successfully saved to {CONFIG_FILE_PATH}")
             return True
 
-        except yaml.YAMLError as e_yaml:
-            logger.error(
-                f"Error formatting data for {CONFIG_FILE_PATH} (YAML error): {e_yaml}",
-                exc_info=True,
+        except yaml.YAMLError:
+            logger.exception(
+                f'Error formatting data for {CONFIG_FILE_PATH} (YAML error): ',
             )
             return False
-        except Exception as e_general:
-            logger.error(
-                f"Failed to save configuration to {CONFIG_FILE_PATH}: {e_general}",
-                exc_info=True,
+        except Exception:
+            logger.exception(
+                f'Failed to save configuration to {CONFIG_FILE_PATH}: ',
             )
             # Attempt to restore from backup if the save operation failed.
             if backup_file.exists() and not CONFIG_FILE_PATH.exists():
@@ -430,9 +428,9 @@ class YamlConfigManager:
                     logger.info(
                         f"Restored configuration from backup {backup_file} due to save failure."
                     )
-                except Exception as restore_error:
-                    logger.error(
-                        f"Failed to restore configuration from backup: {restore_error}"
+                except Exception:
+                    logger.exception(
+                        'Failed to restore configuration from backup: '
                     )
             # Clean up the temporary file if it still exists after a failure.
             if temp_file.exists():
@@ -441,7 +439,7 @@ class YamlConfigManager:
                 except Exception as remove_error:
                     logger.warning(
                         f"Could not remove temporary config file {temp_file}: {remove_error}"
-                    )
+                    , exc_info=True)
             return False
         finally:
             # Clean up the backup file if the main configuration file exists and the save was successful.
@@ -457,7 +455,7 @@ class YamlConfigManager:
                 except Exception as remove_bak_error:
                     logger.warning(
                         f"Could not remove backup config file {backup_file}: {remove_bak_error}"
-                    )
+                    , exc_info=True)
 
     def save_config_yaml(self) -> bool:
         """
@@ -479,7 +477,7 @@ class YamlConfigManager:
             value = _get_nested_value(self.config, keys, default)
         return deepcopy(value) if isinstance(value, (dict, list)) else value
 
-    def get_string(self, key_path: str, default: Optional[str] = None) -> str:
+    def get_string(self, key_path: str, default: str | None = None) -> str:
         """Retrieves a configuration value, ensuring it's a string."""
         # Added this method for explicit string retrieval, common for paths/IDs.
         raw_value = self.get(key_path)
@@ -502,12 +500,12 @@ class YamlConfigManager:
         except Exception:
             logger.warning(
                 f"Could not convert value '{raw_value}' for '{key_path}' to string. Using method default or empty string."
-            )
+            , exc_info=True)
             if default is not None:
                 return default
             return ""
 
-    def get_all(self) -> Dict[str, Any]:
+    def get_all(self) -> dict[str, Any]:
         """
         Returns a deep copy of the entire current configuration.
         Ensures thread-safety during the copy operation.
@@ -515,7 +513,7 @@ class YamlConfigManager:
         with self._lock:
             return deepcopy(self.config)
 
-    def update_and_save(self, partial_update_dict: Dict[str, Any]) -> bool:
+    def update_and_save(self, partial_update_dict: dict[str, Any]) -> bool:
         """
         Deeply merges a 'partial_update_dict' into the current configuration
         and saves the entire updated configuration back to the YAML file.
@@ -549,10 +547,9 @@ class YamlConfigManager:
                 else:
                     logger.error("Failed to save updated configuration after merging.")
                     return False
-            except Exception as e:
-                logger.error(
-                    f"Error during configuration update and save process: {e}",
-                    exc_info=True,
+            except Exception:
+                logger.exception(
+                    'Error during configuration update and save process: ',
                 )
                 return False
 
@@ -585,7 +582,7 @@ class YamlConfigManager:
 
     # --- Type-specific Getters ---
     # These provide convenient, type-checked access to configuration values.
-    def get_int(self, key_path: str, default: Optional[int] = None) -> int:
+    def get_int(self, key_path: str, default: int | None = None) -> int:
         """Retrieves a configuration value, converting it to an integer."""
         raw_value = self.get(key_path)
         if raw_value is None:
@@ -611,7 +608,7 @@ class YamlConfigManager:
             )
             return 0
 
-    def get_float(self, key_path: str, default: Optional[float] = None) -> float:
+    def get_float(self, key_path: str, default: float | None = None) -> float:
         """Retrieves a configuration value, converting it to a float."""
         raw_value = self.get(key_path)
         if raw_value is None:
@@ -637,7 +634,7 @@ class YamlConfigManager:
             )
             return 0.0
 
-    def get_bool(self, key_path: str, default: Optional[bool] = None) -> bool:
+    def get_bool(self, key_path: str, default: bool | None = None) -> bool:
         """Retrieves a configuration value, converting it to a boolean."""
         raw_value = self.get(key_path)
         if raw_value is None:
@@ -672,7 +669,7 @@ class YamlConfigManager:
     def get_path(
         self,
         key_path: str,
-        default_str_path: Optional[str] = None,
+        default_str_path: str | None = None,
         ensure_absolute: bool = False,
     ) -> Path:
         """
@@ -730,7 +727,7 @@ def get_port() -> int:
     )
 
 
-def get_ssl_config() -> Dict[str, str]:
+def get_ssl_config() -> dict[str, str]:
     """Returns uvicorn SSL kwargs if both certfile and keyfile are configured and exist.
     Returns an empty dict when SSL is not configured (HTTP mode)."""
     certfile = config_manager.get("server.ssl_certfile")
@@ -753,11 +750,7 @@ def get_ssl_config() -> Dict[str, str]:
 
 
 # Audio Output Settings Accessors
-def get_audio_output_format() -> str:
-    """Returns the default audio output format (e.g., 'wav')."""
-    return config_manager.get_string(
-        "audio_output.format", _get_default_from_structure("audio_output.format")
-    )
+
 
 
 def get_log_file_path() -> Path:
@@ -900,7 +893,7 @@ def get_audio_sample_rate() -> int:
 
 
 # UI State Accessors
-def get_ui_state() -> Dict[str, Any]:
+def get_ui_state() -> dict[str, Any]:
     """Returns the entire UI state dictionary (for UI persistence)."""
     return config_manager.get(
         "ui_state", deepcopy(_get_default_from_structure("ui_state"))
@@ -915,7 +908,7 @@ def get_ui_title() -> str:
     )
 
 
-def get_full_config_for_template() -> Dict[str, Any]:
+def get_full_config_for_template() -> dict[str, Any]:
     """
     Returns a deep copy of the current configuration, with Path objects
     converted to strings. This is suitable for serialization (e.g., JSON)
