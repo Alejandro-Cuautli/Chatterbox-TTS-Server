@@ -3,24 +3,23 @@
 # This module includes functions for audio processing, text manipulation,
 # file system operations, and performance monitoring.
 
-import os
+import io
 import logging
+import os
 import re
 import time
-import io
 import uuid
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, Set, List
-from pydub import AudioSegment
 
 import numpy as np
 import soundfile as sf
-import torchaudio  # For saving PyTorch tensors and potentially speed adjustment.
 import torch
+import torchaudio  # For saving PyTorch tensors and potentially speed adjustment.
+from pydub import AudioSegment
 
 # Configuration manager to get paths dynamically.
 # Assumes config.py and its config_manager are in the same directory or accessible via PYTHONPATH.
-from config import get_predefined_voices_path, get_reference_audio_path, config_manager
+from config import get_predefined_voices_path, get_reference_audio_path
 
 # Optional import for librosa (for audio resampling, e.g., Opus encoding and time stretching)
 try:
@@ -123,7 +122,7 @@ def sanitize_filename(filename: str) -> str:
 
 # --- Constants for Text Processing ---
 # Set of common abbreviations to help with sentence splitting.
-ABBREVIATIONS: Set[str] = {
+ABBREVIATIONS: set[str] = {
     "mr.",
     "mrs.",
     "ms.",
@@ -179,7 +178,7 @@ ABBREVIATIONS: Set[str] = {
 }
 
 # Common titles that might appear without a period if cleaned by other means first.
-TITLES_NO_PERIOD: Set[str] = {
+TITLES_NO_PERIOD: set[str] = {
     "mr",
     "mrs",
     "ms",
@@ -220,8 +219,8 @@ def encode_audio(
     audio_array: np.ndarray,
     sample_rate: int,
     output_format: str = "opus",
-    target_sample_rate: Optional[int] = None,
-) -> Optional[bytes]:
+    target_sample_rate: int | None = None,
+) -> bytes | None:
     """
     Encodes a NumPy audio array into the specified format (Opus or WAV) in memory.
     Can resample the audio to a target sample rate before encoding if specified.
@@ -246,7 +245,7 @@ def encode_audio(
             audio_array = audio_array.astype(np.float32) / max_val
         else:  # Fallback for other types, assuming they might be float64 or similar
             audio_array = audio_array.astype(np.float32)
-        logger.debug(f"Converted audio array to float32 for encoding.")
+        logger.debug("Converted audio array to float32 for encoding.")
 
     # Ensure audio is mono if it's (samples, 1)
     if audio_array.ndim == 2 and audio_array.shape[1] == 1:
@@ -278,10 +277,9 @@ def encode_audio(
             sample_rate = (
                 target_sample_rate  # Update sample_rate for subsequent encoding
             )
-        except Exception as e_resample:
-            logger.error(
-                f"Error resampling audio to {target_sample_rate}Hz: {e_resample}. Proceeding with original sample rate {sample_rate}.",
-                exc_info=True,
+        except Exception:
+            logger.exception(
+                f'Error resampling audio to {target_sample_rate}Hz: . Proceeding with original sample rate {sample_rate}.',
             )
     elif target_sample_rate is not None and target_sample_rate != sample_rate:
         logger.warning(
@@ -368,8 +366,8 @@ def encode_audio(
             f"Audio encoding/saving is not possible. Please install it. Error: {ie_sf}"
         )
         return None
-    except Exception as e:
-        logger.error(f"Error encoding audio to '{output_format}': {e}", exc_info=True)
+    except Exception:
+        logger.exception(f"Error encoding audio to '{output_format}': ")
         return None
 
 
@@ -427,8 +425,8 @@ def save_audio_to_file(
     except ImportError:
         logger.critical("SoundFile library not found. Cannot save audio.")
         return False
-    except Exception as e:
-        logger.error(f"Error saving WAV file to {file_path}: {e}", exc_info=True)
+    except Exception:
+        logger.exception(f'Error saving WAV file to {file_path}: ')
         return False
 
 
@@ -472,15 +470,15 @@ def save_audio_tensor_to_file(
             f"Saved audio tensor to {file_path} (format: {output_format}) in {end_time - start_time:.3f} seconds."
         )
         return True
-    except Exception as e:
-        logger.error(f"Error saving audio tensor to {file_path}: {e}", exc_info=True)
+    except Exception:
+        logger.exception(f'Error saving audio tensor to {file_path}: ')
         return False
 
 
 # --- Audio Manipulation Utilities ---
 def apply_speed_factor(
     audio_tensor: torch.Tensor, sample_rate: int, speed_factor: float
-) -> Tuple[torch.Tensor, int]:
+) -> tuple[torch.Tensor, int]:
     """
     Applies a speed factor to an audio tensor.
     Uses librosa.effects.time_stretch if available for pitch preservation.
@@ -536,16 +534,14 @@ def apply_speed_factor(
                 f"Applied speed factor {speed_factor} using librosa.effects.time_stretch. Original SR: {sample_rate}"
             )
             return speed_adjusted_tensor, sample_rate  # Sample rate is preserved
-        except Exception as e_librosa:
-            logger.error(
-                f"Failed to apply speed factor {speed_factor} using librosa: {e_librosa}. "
-                f"Falling back to basic resampling (pitch will change).",
-                exc_info=True,
+        except Exception:
+            logger.exception(
+                f'Failed to apply speed factor {speed_factor} using librosa: . Falling back to basic resampling (pitch will change).',
             )
             # Fallback to simple resampling (changes pitch)
             try:
                 new_sample_rate_for_speedup = int(sample_rate / speed_factor)
-                resampler = torchaudio.transforms.Resample(
+                _resampler = torchaudio.transforms.Resample(
                     orig_freq=sample_rate, new_freq=new_sample_rate_for_speedup
                 )
                 # Resample to new_sample_rate_for_speedup to change duration, then resample back to original SR
@@ -558,14 +554,13 @@ def apply_speed_factor(
                 # Given the instruction "Fallback to original audio" if librosa not available or fails, we'll stick to that.
                 # Original plan: "If Librosa is not available, log a warning and return the original audio"
                 logger.warning(
-                    f"Librosa failed for speed factor. Returning original audio as primary fallback."
+                    "Librosa failed for speed factor. Returning original audio as primary fallback."
                 )
                 return audio_tensor, sample_rate
 
-            except Exception as e_resample_fallback:
-                logger.error(
-                    f"Fallback resampling for speed factor {speed_factor} also failed: {e_resample_fallback}. Returning original audio.",
-                    exc_info=True,
+            except Exception:
+                logger.exception(
+                    f'Fallback resampling for speed factor {speed_factor} also failed: . Returning original audio.',
                 )
                 return audio_tensor, sample_rate
 
@@ -610,7 +605,7 @@ def trim_lead_trail_silence(
         frame_length = 2048
         hop_length = 512
 
-        trimmed_audio, index = librosa.effects.trim(
+        _trimmed_audio, index = librosa.effects.trim(
             y=audio_array,
             top_db=top_db_threshold,
             frame_length=frame_length,
@@ -641,8 +636,8 @@ def trim_lead_trail_silence(
         )
         return audio_array
 
-    except Exception as e:
-        logger.error(f"Error during silence trimming: {e}", exc_info=True)
+    except Exception:
+        logger.exception('Error during silence trimming: ')
         return audio_array
 
 
@@ -750,8 +745,8 @@ def fix_internal_silence(
 
         return np.concatenate(fixed_audio_parts)
 
-    except Exception as e:
-        logger.error(f"Error during internal silence fixing: {e}", exc_info=True)
+    except Exception:
+        logger.exception('Error during internal silence fixing: ')
         return audio_array
 
 
@@ -838,8 +833,8 @@ def remove_long_unvoiced_segments(
 
         return np.concatenate(segments_to_keep)
 
-    except Exception as e:
-        logger.error(f"Error during unvoiced segment removal: {e}", exc_info=True)
+    except Exception:
+        logger.exception('Error during unvoiced segment removal: ')
         return audio_array
 
 
@@ -879,12 +874,12 @@ def _is_valid_sentence_end(text: str, period_index: int) -> bool:
     return True
 
 
-def _split_text_by_punctuation(text: str) -> List[str]:
+def _split_text_by_punctuation(text: str) -> list[str]:
     """
     Splits text into sentences based on common punctuation marks (.!?),
     while trying to avoid splitting on periods used in abbreviations or numbers.
     """
-    sentences: List[str] = []
+    sentences: list[str] = []
     last_split_index = 0
     text_length = len(text)
 
@@ -929,7 +924,7 @@ def _split_text_by_punctuation(text: str) -> List[str]:
     return sentences
 
 
-def split_into_sentences(text: str) -> List[str]:
+def split_into_sentences(text: str) -> list[str]:
     """
     Splits a given text into sentences. Handles normalization of line breaks
     and considers bullet points as potential sentence separators.
@@ -943,7 +938,7 @@ def split_into_sentences(text: str) -> List[str]:
 
     if len(bullet_point_matches) >= 2:
         logger.debug("Bullet list detected (2+ items); splitting by bullet items.")
-        processed_sentences: List[str] = []
+        processed_sentences: list[str] = []
         current_position = 0
         for i, bullet_match in enumerate(bullet_point_matches):
             bullet_actual_start_index = bullet_match.start()
@@ -982,7 +977,7 @@ def split_into_sentences(text: str) -> List[str]:
         return _split_text_by_punctuation(text)
 
 
-def _preprocess_and_segment_text(full_text: str) -> List[Tuple[Optional[str], str]]:
+def _preprocess_and_segment_text(full_text: str) -> list[tuple[str | None, str]]:
     """
     Internal helper to segment text by non-verbal cues (e.g., (laughs)) and then
     further split those segments into sentences.
@@ -999,8 +994,8 @@ def _preprocess_and_segment_text(full_text: str) -> List[Tuple[Optional[str], st
     if not full_text or full_text.isspace():
         return []
 
-    placeholder_tag: Optional[str] = None
-    segmented_with_tags: List[Tuple[Optional[str], str]] = []
+    placeholder_tag: str | None = None
+    segmented_with_tags: list[tuple[str | None, str]] = []
     parts_and_cues = NON_VERBAL_CUE_PATTERN.split(full_text)
 
     for part in parts_and_cues:
@@ -1026,7 +1021,7 @@ def _preprocess_and_segment_text(full_text: str) -> List[Tuple[Optional[str], st
 def chunk_text_by_sentences(
     full_text: str,
     chunk_size: int,
-) -> List[str]:
+) -> list[str]:
     """
     Chunks text into manageable pieces for TTS processing, respecting sentence boundaries
     and a maximum chunk character length. Designed for single-speaker text, but maintains
@@ -1049,8 +1044,8 @@ def chunk_text_by_sentences(
     if not processed_segments:
         return []
 
-    text_chunks: List[str] = []
-    current_chunk_sentences: List[str] = []
+    text_chunks: list[str] = []
+    current_chunk_sentences: list[str] = []
     current_chunk_length = 0
 
     for (
@@ -1096,13 +1091,13 @@ def chunk_text_by_sentences(
 
 
 # --- File System Utilities ---
-def get_valid_reference_files() -> List[str]:
+def get_valid_reference_files() -> list[str]:
     """
     Scans the configured reference audio directory and returns a sorted list of
     valid audio filenames (.wav, .mp3).
     """
     ref_audio_dir_path = get_reference_audio_path()
-    valid_files: List[str] = []
+    valid_files: list[str] = []
     allowed_extensions = (".wav", ".mp3")
 
     try:
@@ -1119,15 +1114,14 @@ def get_valid_reference_files() -> List[str]:
                 f"Reference audio directory not found: {ref_audio_dir_path}. Creating it."
             )
             ref_audio_dir_path.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        logger.error(
-            f"Error reading reference audio directory '{ref_audio_dir_path}': {e}",
-            exc_info=True,
+    except Exception:
+        logger.exception(
+            f"Error reading reference audio directory '{ref_audio_dir_path}': ",
         )
     return sorted(valid_files)
 
 
-def get_predefined_voices() -> List[Dict[str, str]]:
+def get_predefined_voices() -> list[dict[str, str]]:
     """
     Scans the configured predefined voices directory, formats their display names,
     and returns a sorted list of voice dictionaries. Handles duplicate base names.
@@ -1136,7 +1130,7 @@ def get_predefined_voices() -> List[Dict[str, str]]:
         List of dictionaries: [{"display_name": "Formatted Name", "filename": "original_file.wav"}, ...]
     """
     voices_dir_path = get_predefined_voices_path()
-    predefined_voice_list: List[Dict[str, str]] = []
+    predefined_voice_list: list[dict[str, str]] = []
     allowed_extensions = (".wav", ".mp3")
 
     try:
@@ -1170,7 +1164,7 @@ def get_predefined_voices() -> List[Dict[str, str]]:
                 )
 
         temp_voice_info_list.sort(key=lambda x: x["display_name_base"].lower())
-        display_name_counts: Dict[str, int] = {}
+        display_name_counts: dict[str, int] = {}
 
         for voice_info in temp_voice_info_list:
             base_display = voice_info["display_name_base"]
@@ -1195,18 +1189,17 @@ def get_predefined_voices() -> List[Dict[str, str]]:
             f"Found {len(predefined_voice_list)} predefined voices in {voices_dir_path}"
         )
 
-    except Exception as e:
-        logger.error(
-            f"Error reading predefined voices directory '{voices_dir_path}': {e}",
-            exc_info=True,
+    except Exception:
+        logger.exception(
+            f"Error reading predefined voices directory '{voices_dir_path}': ",
         )
         predefined_voice_list = []
     return predefined_voice_list
 
 
 def validate_reference_audio(
-    file_path: Path, max_duration_sec: Optional[int] = None
-) -> Tuple[bool, str]:
+    file_path: Path, max_duration_sec: int | None = None
+) -> tuple[bool, str]:
     """
     Validates a reference audio file. Checks for existence, valid audio type (WAV/MP3),
     and optionally enforces a maximum duration.
@@ -1242,7 +1235,7 @@ def validate_reference_audio(
             logger.warning(
                 f"Could not accurately determine duration of reference audio '{file_path.name}': {e}. "
                 f"Skipping duration check for this file."
-            )
+            , exc_info=True)
     return True, "Reference audio appears valid."
 
 
@@ -1254,7 +1247,7 @@ class PerformanceMonitor:
     """
 
     def __init__(
-        self, enabled: bool = True, logger_instance: Optional[logging.Logger] = None
+        self, enabled: bool = True, logger_instance: logging.Logger | None = None
     ):
         self.enabled: bool = enabled
         self.logger = (
@@ -1263,7 +1256,7 @@ class PerformanceMonitor:
             else logging.getLogger(__name__)
         )
         self.start_time: float = 0.0
-        self.events: List[Tuple[str, float]] = []
+        self.events: list[tuple[str, float]] = []
         if self.enabled:
             self.start_time = time.monotonic()
             self.events.append(("Monitoring Started", self.start_time))

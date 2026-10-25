@@ -35,10 +35,10 @@ Requirements:
     - Python 3.10 or later
     - Internet connection for downloading dependencies
 """
-
 import argparse
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -53,6 +53,8 @@ import urllib.request
 import zipfile
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # CONFIGURATION
@@ -170,7 +172,7 @@ class Colors:
                 kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
             except Exception:
                 # If this fails, colors just won't work (non-fatal)
-                pass
+                logger.warning("Handled exception in enable_windows_colors", exc_info=True)
 
 
 # Enable Windows colors at module load time
@@ -302,11 +304,12 @@ def run_command(cmd, cwd=None, check=True, capture=False, show_output=False):
             )
             return True
 
-    except subprocess.CalledProcessError as e:
+    except subprocess.CalledProcessError:
         if check:
             raise
         return None if capture else False
     except Exception as e:
+        logger.warning("Handled exception in run_command", exc_info=True)
         if VERBOSE_MODE:
             print_error(f"Command error: {e}")
         return None if capture else False
@@ -351,7 +354,7 @@ def run_command_with_progress(cmd, cwd=None, description="Working"):
     try:
         result = subprocess.run(
             cmd, shell=True, cwd=cwd, capture_output=True, text=True
-        )
+        , check=False)
 
         stop_progress.set()
         progress_thread.join(timeout=1)
@@ -368,6 +371,7 @@ def run_command_with_progress(cmd, cwd=None, description="Working"):
         return True
 
     except Exception as e:
+        logger.warning("Handled exception in run_command_with_progress", exc_info=True)
         stop_progress.set()
         progress_thread.join(timeout=1)
         print_error(f"Error running command: {e}")
@@ -470,7 +474,7 @@ def create_venv(venv_dir):
             [sys.executable, "-m", "venv", str(venv_dir)],
             capture_output=True,
             text=True,
-        )
+        check=False)
 
         if result.returncode != 0:
             print_substep("Failed to create virtual environment", "error")
@@ -482,6 +486,7 @@ def create_venv(venv_dir):
         return True
 
     except Exception as e:
+        logger.warning("Handled exception in create_venv", exc_info=True)
         print_substep(f"Error creating venv: {e}", "error")
         return False
 
@@ -507,7 +512,7 @@ def get_install_state(venv_dir):
         try:
             install_type = install_type_file.read_text(encoding="utf-8").strip()
         except Exception:
-            pass
+            logger.warning("Handled exception in get_install_state", exc_info=True)
 
     return True, install_type
 
@@ -527,12 +532,13 @@ def save_install_state(venv_dir, install_type):
 
         # Save completion marker with timestamp
         install_complete_file = venv_dir / ".install_complete"
-        timestamp = datetime.now().isoformat()
+        timestamp = datetime.now().astimezone().isoformat()
         install_complete_file.write_text(
             f"Installation completed at {timestamp}\n" f"Type: {install_type}\n",
             encoding="utf-8",
         )
     except Exception as e:
+        logger.warning("Handled exception in save_install_state", exc_info=True)
         print_warning(f"Could not save install state: {e}")
 
 
@@ -549,6 +555,7 @@ def clear_install_complete(venv_dir):
         if install_complete_file.exists():
             install_complete_file.unlink()
     except Exception as e:
+        logger.warning("Handled exception in clear_install_complete", exc_info=True)
         print_warning(f"Could not clear install marker: {e}")
 
 
@@ -592,6 +599,7 @@ def robust_rmtree(path):
                 )
                 time.sleep(retry_delay)
         except Exception:
+            logger.warning("Handled exception in robust_rmtree", exc_info=True)
             break  # Non-permission error, skip to rename fallback
 
     # Fallback: rename aside so we can proceed even if deletion fails
@@ -606,7 +614,7 @@ def robust_rmtree(path):
         print_substep("You can safely delete that folder later.", "info")
         return True
     except Exception:
-        pass
+        logger.warning("Handled exception in robust_rmtree", exc_info=True)
 
     return False
 
@@ -673,7 +681,7 @@ def is_embedded_python_available(root_dir):
     Returns:
         True if embedded Python is ready to use
     """
-    embedded_dir, embedded_python, embedded_pip = get_embedded_python_paths(root_dir)
+    _embedded_dir, embedded_python, embedded_pip = get_embedded_python_paths(root_dir)
 
     if not embedded_python.exists() or not embedded_pip.exists():
         return False
@@ -684,9 +692,10 @@ def is_embedded_python_available(root_dir):
             capture_output=True,
             text=True,
             timeout=10,
-        )
+        check=False)
         return result.returncode == 0
     except Exception:
+        logger.warning("Handled exception in is_embedded_python_available", exc_info=True)
         return False
 
 
@@ -758,6 +767,7 @@ def download_file(url, dest_path, description="Downloading"):
         return True
 
     except Exception as e:
+        logger.warning("Handled exception in download_file", exc_info=True)
         sys.stdout.write("\n")
         sys.stdout.flush()
         print_substep(f"Download failed: {e}", "error")
@@ -771,7 +781,7 @@ def download_file(url, dest_path, description="Downloading"):
             if part_path.exists():
                 part_path.unlink()
         except Exception:
-            pass
+            logger.warning("Handled exception in download_file", exc_info=True)
 
 
 def verify_checksum(file_path, expected_sha256):
@@ -872,6 +882,7 @@ def patch_pth_file(embedded_dir):
         return True
 
     except Exception as e:
+        logger.warning("Handled exception in patch_pth_file", exc_info=True)
         print_substep(f"Failed to patch ._pth file: {e}", "error")
         return False
 
@@ -929,6 +940,7 @@ if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
         if VERBOSE_MODE:
             print_substep("Created sitecustomize.py for DLL search paths", "done")
     except Exception as e:
+        logger.warning("Handled exception in _create_dll_search_sitecustomize", exc_info=True)
         print_substep(f"Could not create sitecustomize.py: {e}", "warning")
 
 
@@ -955,10 +967,9 @@ def setup_embedded_python(root_dir):
         return True
 
     # Clean up any partial previous attempt
-    if embedded_dir.exists():
-        if not robust_rmtree(embedded_dir):
-            print_substep("Could not clean up partial install", "error")
-            return False
+    if embedded_dir.exists() and not robust_rmtree(embedded_dir):
+        print_substep("Could not clean up partial install", "error")
+        return False
 
     print_substep(
         f"Setting up portable Python {EMBEDDED_PYTHON_VERSION} environment...", "info"
@@ -1002,6 +1013,7 @@ def setup_embedded_python(root_dir):
                 zf.extractall(str(embedded_dir))
             print_substep("Python extracted", "done")
         except Exception as e:
+            logger.warning("Handled exception in setup_embedded_python", exc_info=True)
             print_substep(f"Extraction failed: {e}", "error")
             return False
 
@@ -1021,9 +1033,9 @@ def setup_embedded_python(root_dir):
 
         pip_cmd = [str(embedded_python), str(get_pip_path)]
         if VERBOSE_MODE:
-            result = subprocess.run(pip_cmd)
+            result = subprocess.run(pip_cmd, check=False)
         else:
-            result = subprocess.run(pip_cmd, capture_output=True, text=True)
+            result = subprocess.run(pip_cmd, capture_output=True, text=True, check=False)
 
         if result.returncode != 0:
             print_substep("Failed to install pip", "error")
@@ -1056,9 +1068,9 @@ def setup_embedded_python(root_dir):
             "setuptools",
         ]
         if VERBOSE_MODE:
-            st_result = subprocess.run(setuptools_cmd)
+            st_result = subprocess.run(setuptools_cmd, check=False)
         else:
-            st_result = subprocess.run(setuptools_cmd, capture_output=True, text=True)
+            st_result = subprocess.run(setuptools_cmd, capture_output=True, text=True, check=False)
 
         if st_result.returncode != 0:
             print_substep(
@@ -1075,6 +1087,7 @@ def setup_embedded_python(root_dir):
         return True
 
     except Exception as e:
+        logger.warning("Handled exception in setup_embedded_python", exc_info=True)
         print_substep(f"Unexpected error during setup: {e}", "error")
         return False
 
@@ -1085,7 +1098,7 @@ def setup_embedded_python(root_dir):
                 if temp_file.exists():
                     temp_file.unlink()
             except Exception:
-                pass
+                logger.warning("Handled exception in setup_embedded_python", exc_info=True)
 
 
 def prompt_portable_install(reason="portability"):
@@ -1216,7 +1229,7 @@ def detect_nvidia_gpu():
             capture_output=True,
             text=True,
             timeout=10,
-        )
+        check=False)
 
         if result.returncode == 0 and result.stdout.strip():
             gpu_name = result.stdout.strip().split("\n")[0]
@@ -1230,6 +1243,7 @@ def detect_nvidia_gpu():
     except subprocess.TimeoutExpired:
         return False, None
     except Exception:
+        logger.warning("Handled exception in detect_nvidia_gpu", exc_info=True)
         return False, None
 
 
@@ -1246,7 +1260,7 @@ def detect_amd_gpu():
             capture_output=True,
             text=True,
             timeout=10,
-        )
+        check=False)
 
         if result.returncode == 0 and result.stdout.strip():
             # Parse output to find GPU name
@@ -1269,6 +1283,7 @@ def detect_amd_gpu():
     except subprocess.TimeoutExpired:
         return False, None
     except Exception:
+        logger.warning("Handled exception in detect_amd_gpu", exc_info=True)
         return False, None
 
 
@@ -1558,10 +1573,7 @@ def perform_installation(venv_pip, install_type, root_dir):
     # Step 2: Install chatterbox separately with --no-deps for ALL install types.
     # This prevents pip from pulling in conflicting torch versions and avoids
     # ONNX source build failures on platforms without pre-built wheels.
-    if not install_chatterbox_no_deps(venv_pip):
-        return False
-
-    return True
+    return bool(install_chatterbox_no_deps(venv_pip))
 
 
 def _patch_chatterbox_watermarker(env_dir, use_embedded):
@@ -1629,6 +1641,7 @@ def _patch_chatterbox_watermarker(env_dir, use_embedded):
         try:
             content = filepath.read_text(encoding="utf-8")
         except Exception as e:
+            logger.warning("Handled exception in _patch_chatterbox_watermarker", exc_info=True)
             print_substep(f"{filename}: could not read ({e}), skipping", "warning")
             continue
 
@@ -1686,6 +1699,7 @@ def _patch_chatterbox_watermarker(env_dir, use_embedded):
             print_substep(f"{filename}: watermarker made optional", "done")
             patched_count += 1
         except Exception as e:
+            logger.warning("Handled exception in _patch_chatterbox_watermarker", exc_info=True)
             print_substep(f"{filename}: could not write ({e})", "warning")
 
     if patched_count > 0:
@@ -1767,6 +1781,7 @@ def _patch_chatterbox_mps_float32(env_dir, use_embedded):
                     s3tok_path.write_text(content, encoding="utf-8")
                     print_substep("s3tokenizer.py: MPS float32 fix applied", "done")
         except Exception as e:
+            logger.warning("Handled exception in _patch_chatterbox_mps_float32", exc_info=True)
             if VERBOSE_MODE:
                 print_substep(f"s3tokenizer.py: could not patch ({e})", "warning")
 
@@ -1784,6 +1799,7 @@ def _patch_chatterbox_mps_float32(env_dir, use_embedded):
                     ve_path.write_text(content, encoding="utf-8")
                     print_substep("voice_encoder.py: MPS float32 fix applied", "done")
         except Exception as e:
+            logger.warning("Handled exception in _patch_chatterbox_mps_float32", exc_info=True)
             if VERBOSE_MODE:
                 print_substep(f"voice_encoder.py: could not patch ({e})", "warning")
 
@@ -1857,7 +1873,7 @@ print(json.dumps(results))
             capture_output=True,
             text=True,
             timeout=60,
-        )
+        check=False)
 
         if result.returncode != 0:
             print_substep("Verification script returned non-zero", "warning")
@@ -1928,6 +1944,7 @@ print(json.dumps(results))
         print_substep("Verification timed out", "warning")
         return False
     except Exception as e:
+        logger.warning("Handled exception in verify_installation", exc_info=True)
         print_substep(f"Verification error: {e}", "warning")
         return False
 
@@ -1982,6 +1999,7 @@ def read_config(root_dir):
 
     except Exception as e:
         # Silently use defaults on any error
+        logger.warning("Handled exception in read_config", exc_info=True)
         if VERBOSE_MODE:
             print_warning(f"Could not parse config.yaml: {e}")
 
@@ -2011,7 +2029,7 @@ def check_port_in_use(host, port):
 
         return result == 0
 
-    except socket.error:
+    except OSError:
         return False
 
 
@@ -2056,7 +2074,7 @@ def wait_for_server(host, port, timeout=SERVER_STARTUP_TIMEOUT):
                 print_substep(f"Server ready! (took {elapsed:.1f}s)", "done")
                 return True
 
-        except socket.error:
+        except OSError:
             pass
 
         # Show progress dots
@@ -2169,6 +2187,7 @@ def cleanup_server(process):
 
     except Exception as e:
         # Process might already be gone
+        logger.warning("Handled exception in cleanup_server", exc_info=True)
         if VERBOSE_MODE:
             print_warning(f"Error during cleanup: {e}")
 
@@ -2424,14 +2443,13 @@ def main():
         # Remove all possible environment directories (venv and/or embedded)
         for env_name in [VENV_FOLDER, EMBEDDED_PYTHON_DIR]:
             env_path = root_dir / env_name
-            if env_path.exists():
-                if not remove_venv(env_path):
-                    print_error(f"Could not remove {env_name}/.")
-                    print_substep(
-                        f"Please manually delete the '{env_name}' folder and try again.",
-                        "info",
-                    )
-                    sys.exit(1)
+            if env_path.exists() and not remove_venv(env_path):
+                print_error(f"Could not remove {env_name}/.")
+                print_substep(
+                    f"Please manually delete the '{env_name}' folder and try again.",
+                    "info",
+                )
+                sys.exit(1)
 
         # Re-setup embedded Python if that path was chosen
         if use_embedded:
@@ -2754,6 +2772,7 @@ if __name__ == "__main__":
         print("Interrupted by user.")
         sys.exit(2)
     except Exception as e:
+        logger.warning("Handled exception in module", exc_info=True)
         print()
         print_error(f"Unexpected error: {e}")
         print()

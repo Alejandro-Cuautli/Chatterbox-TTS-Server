@@ -2,10 +2,10 @@
 # Utility script to download the TTS model and its components.
 # This script focuses on ensuring the core engine model files are available locally
 # in the path specified by the application's configuration.
-
 import logging
-import os
+import sys
 from pathlib import Path
+
 from huggingface_hub import hf_hub_download
 
 # Configure basic logging for the script
@@ -21,7 +21,7 @@ try:
     from config import config_manager
 except ImportError:
     logger.error("Failed to import config_manager. Ensure config.py is accessible.")
-    exit(1)
+    sys.exit(1)
 
 
 # Define the list of core model files expected by the TTS engine.
@@ -57,10 +57,9 @@ def download_engine_files():
     try:
         model_cache_path.mkdir(parents=True, exist_ok=True)
         logger.info(f"Ensured download directory exists: {model_cache_path}")
-    except Exception as e:
-        logger.error(
-            f"Could not create or access download directory '{model_cache_path}': {e}",
-            exc_info=True,
+    except Exception:
+        logger.exception(
+            f"Could not create or access download directory '{model_cache_path}': ",
         )
         return False
 
@@ -80,8 +79,8 @@ def download_engine_files():
             logger.info(
                 f"Successfully downloaded or found '{filename}' in '{model_cache_path}'."
             )
-        except Exception as e:
-            logger.error(f"Failed to download '{filename}': {e}", exc_info=True)
+        except Exception:
+            logger.exception(f"Failed to download '{filename}': ")
             all_successful = False
             # Optionally, continue trying to download other files
 
@@ -102,6 +101,6 @@ if __name__ == "__main__":
         logger.error(
             "Model download process encountered errors. The server might not start correctly."
         )
-        exit(1)  # Exit with error code if essential downloads failed
+        sys.exit(1)  # Exit with error code if essential downloads failed
 
 # --- End File: download_model.py ---

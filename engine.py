@@ -5,15 +5,10 @@ import gc
 import logging
 import os
 import random
+
 import numpy as np
 import torch
-from typing import Optional, Tuple
-from pathlib import Path
-
 from chatterbox.tts import ChatterboxTTS  # Main TTS engine class
-from chatterbox.models.s3gen.const import (
-    S3GEN_SR,
-)  # Default sample rate from the engine
 
 # Defensive Turbo import - Turbo may not be available in older package versions
 try:
@@ -26,7 +21,7 @@ except ImportError:
 
 # Defensive Multilingual import
 try:
-    from chatterbox import ChatterboxMultilingualTTS, SUPPORTED_LANGUAGES
+    from chatterbox import SUPPORTED_LANGUAGES, ChatterboxMultilingualTTS
 
     MULTILINGUAL_AVAILABLE = True
 except ImportError:
@@ -102,15 +97,15 @@ def _resolve_bf16_setting() -> bool:
 BF16_ENABLED: bool = _resolve_bf16_setting()
 
 # --- Global Module Variables ---
-chatterbox_model: Optional[ChatterboxTTS] = None
+chatterbox_model: ChatterboxTTS | None = None
 MODEL_LOADED: bool = False
-model_device: Optional[str] = (
+model_device: str | None = (
     None  # Stores the resolved device string ('cuda' or 'cpu')
 )
 
 # Track which model type is loaded
-loaded_model_type: Optional[str] = None  # "original" or "turbo"
-loaded_model_class_name: Optional[str] = None  # "ChatterboxTTS" or "ChatterboxTurboTTS"
+loaded_model_type: str | None = None  # "original" or "turbo"
+loaded_model_class_name: str | None = None  # "ChatterboxTTS" or "ChatterboxTurboTTS"
 
 # Voice conditioning cache: avoids re-encoding the same voice file on every request.
 # Key: (resolved_path, file_mtime, exaggeration) — mtime invalidates if file changes.
@@ -157,7 +152,7 @@ def _test_cuda_functionality() -> bool:
         test_tensor = test_tensor.cpu()
         return True
     except Exception as e:
-        logger.warning(f"CUDA functionality test failed: {e}")
+        logger.warning(f"CUDA functionality test failed: {e}", exc_info=True)
         return False
 
 
@@ -177,7 +172,7 @@ def _test_mps_functionality() -> bool:
         test_tensor = test_tensor.cpu()
         return True
     except Exception as e:
-        logger.warning(f"MPS functionality test failed: {e}")
+        logger.warning(f"MPS functionality test failed: {e}", exc_info=True)
         return False
 
 
@@ -384,18 +379,16 @@ def load_model() -> bool:
 
             logger.info(f"Successfully loaded {model_class.__name__} on {model_device}")
             logger.info(f"Model sample rate: {chatterbox_model.sr} Hz")
-        except ImportError as e_import:
-            logger.error(
-                f"Failed to load model due to import error: {e_import}",
-                exc_info=True,
+        except ImportError:
+            logger.exception(
+                'Failed to load model due to import error: ',
             )
             chatterbox_model = None
             MODEL_LOADED = False
             return False
-        except Exception as e_hf:
-            logger.error(
-                f"Failed to load model using from_pretrained: {e_hf}",
-                exc_info=True,
+        except Exception:
+            logger.exception(
+                'Failed to load model using from_pretrained: ',
             )
             chatterbox_model = None
             MODEL_LOADED = False
@@ -415,9 +408,9 @@ def load_model() -> bool:
 
         return True
 
-    except Exception as e:
-        logger.error(
-            f"An unexpected error occurred during model loading: {e}", exc_info=True
+    except Exception:
+        logger.exception(
+            'An unexpected error occurred during model loading: '
         )
         chatterbox_model = None
         MODEL_LOADED = False
@@ -426,13 +419,13 @@ def load_model() -> bool:
 
 def synthesize(
     text: str,
-    audio_prompt_path: Optional[str] = None,
+    audio_prompt_path: str | None = None,
     temperature: float = 0.8,
     exaggeration: float = 0.5,
     cfg_weight: float = 0.5,
     seed: int = 0,
     language: str = "en",
-) -> Tuple[Optional[torch.Tensor], Optional[int]]:
+) -> tuple[torch.Tensor | None, int | None]:
     """
     Synthesizes audio from text using the loaded TTS model.
 
@@ -450,7 +443,7 @@ def synthesize(
         A tuple containing the audio waveform (torch.Tensor) and the sample rate (int),
         or (None, None) if synthesis fails.
     """
-    global chatterbox_model
+
 
     if not MODEL_LOADED or chatterbox_model is None:
         logger.error("TTS model is not loaded. Cannot synthesize audio.")
@@ -507,16 +500,15 @@ def synthesize(
                 )
 
         # Store conds in cache after first compute for this voice.
-        if conds_key is not None and effective_prompt is not None:
-            if chatterbox_model.conds is not None:
-                _conds_cache[conds_key] = chatterbox_model.conds
-                logger.debug(f"Cached voice conditionals for: {audio_prompt_path}")
+        if conds_key is not None and effective_prompt is not None and chatterbox_model.conds is not None:
+            _conds_cache[conds_key] = chatterbox_model.conds
+            logger.debug(f"Cached voice conditionals for: {audio_prompt_path}")
 
         # The ChatterboxTTS.generate method already returns a CPU tensor.
         return wav_tensor, chatterbox_model.sr
 
-    except Exception as e:
-        logger.error(f"Error during TTS synthesis: {e}", exc_info=True)
+    except Exception:
+        logger.exception('Error during TTS synthesis: ')
         return None, None
 
 
@@ -576,7 +568,7 @@ def reload_model() -> bool:
     Returns:
         bool: True if the new model loaded successfully, False otherwise.
     """
-    global chatterbox_model, MODEL_LOADED, model_device, loaded_model_type, loaded_model_class_name, _conds_cache
+    global chatterbox_model, MODEL_LOADED, loaded_model_type, loaded_model_class_name
 
     logger.info("Initiating model hot-swap/reload sequence...")
 

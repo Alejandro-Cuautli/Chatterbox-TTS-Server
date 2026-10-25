@@ -11,7 +11,7 @@ on:
     branches: [main]
   # Allow re-running CI on pushes to feature branches too.
   push:
-    branches-ignore: [main]
+    branches: [main, "claude/**"]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -19,9 +19,18 @@ concurrency:
 
 jobs:
   test:
-    runs-on: [self-hosted, ARM64, synaptic-voice-studio]
+    runs-on: [self-hosted, X64, synaptic-voice-studio, ephemeral]
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/alejandro-cuautli/chatterbox-tts-server:${{ github.event.pull_request.head.sha || github.sha }}-cpu
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # uv (venv) sin python3-venv en el host del farm
+        with:
+          enable-cache: 'false'
+          python-version: '3.10'
 
       # ---- Node ----
       - name: Setup Node
@@ -42,11 +51,34 @@ jobs:
       - name: Python install + test
         if: ${{ hashFiles('pyproject.toml', 'requirements.txt') != '' }}
         run: |
-          python3 -m venv .venv-ci
+          uv venv --python 3.10 --seed .venv-ci
           . .venv-ci/bin/activate
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f pyproject.toml ]; then pip install -e .; fi
-          pip install ruff pytest
-          ruff check .
+          # Same engine install as Dockerfile.cpu/start.py: chatterbox is kept out of
+          # requirements.txt and must be installed with --no-deps.
+          pip install --no-deps git+https://github.com/devnen/chatterbox-v2.git@master s3tokenizer==0.3.0 onnx==1.16.0
+          pip install "protobuf>=4.25.0"
+          pip install -r requirements-test.txt
+          # Preserve Python 3.10 compatibility even when farm defaults target newer Python.
+          ruff check --target-version py310 .
           pytest -q
+
+      - name: Build and smoke the amd64 CPU runtime
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 --label org.opencontainers.image.source=https://github.com/Alejandro-Cuautli/Chatterbox-TTS-Server --label org.opencontainers.image.revision="$(git rev-parse HEAD)" -f Dockerfile.cpu -t "$IMAGE" .
+          test "$(docker image inspect -f '{{.Architecture}}' "$IMAGE")" = amd64
+          docker run --rm --network none --entrypoint python "$IMAGE" -c 'import models; assert models.CustomTTSRequest(text="CPU smoke").text == "CPU smoke"'
+      - name: Publish immutable CPU runtime from main
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          export DOCKER_CONFIG=$(mktemp -d "$RUNNER_TEMP/tts-publish.XXXXXX")
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
+          docker image inspect -f '{{json .RepoDigests}}' "$IMAGE"
