@@ -22,6 +22,9 @@ jobs:
     runs-on: [self-hosted, X64, synaptic-voice-studio]
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # uv (venv) sin python3-venv en el host del farm
+        with:
+          enable-cache: 'false'
 
       # ---- Node ----
       - name: Setup Node
@@ -42,7 +45,7 @@ jobs:
       - name: Python install + test
         if: ${{ hashFiles('pyproject.toml', 'requirements.txt') != '' }}
         run: |
-          python3 -m venv .venv-ci
+          uv venv --seed .venv-ci
           . .venv-ci/bin/activate
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
