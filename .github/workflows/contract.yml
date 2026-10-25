@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   contract:
-    runs-on: [self-hosted, ARM64, synaptic-voice-studio]
+    runs-on: [self-hosted, X64, synaptic-voice-studio]
     steps:
       - uses: actions/checkout@v4
       - name: Hermes Project Contract self-check
