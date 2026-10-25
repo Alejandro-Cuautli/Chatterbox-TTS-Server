@@ -57,7 +57,8 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f pyproject.toml ]; then pip install -e .; fi
           pip install ruff pytest
-          ruff check .
+          # Preserve Python 3.10 compatibility even when farm defaults target newer Python.
+          ruff check --target-version py310 .
           pytest -q
 
       - name: Build and smoke the amd64 CPU runtime
