@@ -29,8 +29,9 @@ import re
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
 JOB_ID_HEADER = "X-Synaptic-Job-Id"
 BOOT_ID = uuid.uuid4().hex
@@ -53,7 +54,7 @@ def require_job_id() -> bool:
     return os.environ.get("SYNAPTIC_REQUIRE_JOB_ID", "0").lower() in ("1", "true", "yes")
 
 
-def valid_job_id(job_id: Optional[str]) -> bool:
+def valid_job_id(job_id: str | None) -> bool:
     return bool(job_id and _ID_RE.match(job_id))
 
 
@@ -78,11 +79,11 @@ def _write_atomic(path: Path, data: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def _save(record: Dict[str, Any]) -> None:
+def _save(record: dict[str, Any]) -> None:
     _write_atomic(_meta_path(record["job_id"]), json.dumps(record).encode())
 
 
-def get(job_id: str) -> Optional[Dict[str, Any]]:
+def get(job_id: str) -> dict[str, Any] | None:
     try:
         record = json.loads(_meta_path(job_id).read_text())
     except (FileNotFoundError, ValueError):
@@ -93,7 +94,7 @@ def get(job_id: str) -> Optional[Dict[str, Any]]:
     return record
 
 
-def begin(job_id: str, output_format: str) -> Optional[Dict[str, Any]]:
+def begin(job_id: str, output_format: str) -> dict[str, Any] | None:
     """Claim `job_id`. Returns None when claimed, or the existing record when
     it already succeeded or is still running in this process."""
     with _LOCK:
@@ -121,7 +122,7 @@ def fail(job_id: str, error: str) -> None:
         _save(record)
 
 
-def audio(job_id: str) -> Optional[bytes]:
+def audio(job_id: str) -> bytes | None:
     record = get(job_id)
     if not record or record.get("status") != "succeeded":
         return None
@@ -135,7 +136,7 @@ def audio(job_id: str) -> Optional[bytes]:
     return data
 
 
-def submit(job_id: Optional[str], output_format: str, work: Callable[[], bytes]) -> concurrent.futures.Future:
+def submit(job_id: str | None, output_format: str, work: Callable[[], bytes]) -> concurrent.futures.Future:
     """Run `work` on the journal executor; record the outcome when it ends,
     whether or not anyone is still awaiting the HTTP response."""
     future = _EXECUTOR.submit(work)
@@ -151,7 +152,7 @@ def submit(job_id: Optional[str], output_format: str, work: Callable[[], bytes])
     return future
 
 
-def cleanup(now: Optional[float] = None) -> int:
+def cleanup(now: float | None = None) -> int:
     cutoff = (now or time.time()) - RETENTION_S
     removed = 0
     for path in jobs_dir().iterdir():
