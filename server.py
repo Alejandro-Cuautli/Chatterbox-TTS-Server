@@ -22,6 +22,7 @@ from fastapi import (
     BackgroundTasks,
     FastAPI,
     File,
+    Header,
     HTTPException,
     Request,
     UploadFile,
@@ -38,6 +39,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 import engine  # TTS Engine interface
+import synaptic_jobs  # Durable job journal for Model Manager dispatches
 import utils  # Utility functions
 
 # --- Internal Project Imports ---
@@ -146,6 +148,8 @@ async def lifespan(app: FastAPI):
     """Manages application startup and shutdown events."""
     logger.info("TTS Server: Initializing application...")
     try:
+        removed = synaptic_jobs.cleanup()
+        logger.info(f"Synaptic job journal at {synaptic_jobs.jobs_dir()} ({removed} expired entries removed).")
         logger.info(f"Configuration loaded. Log file at: {get_log_file_path()}")
 
         paths_to_ensure = [
@@ -871,13 +875,28 @@ async def upload_predefined_voice_endpoint(files: Annotated[list[UploadFile], Fi
     },
 )
 async def custom_tts_endpoint(
-    request: CustomTTSRequest, background_tasks: BackgroundTasks
+    request: CustomTTSRequest,
+    background_tasks: BackgroundTasks,
+    x_synaptic_job_id: Annotated[str | None, Header(alias=synaptic_jobs.JOB_ID_HEADER)] = None,
 ):
     """
     Generates speech audio from text using specified parameters.
     Handles various voice modes (predefined, clone) and audio processing options.
     Returns audio as a stream (WAV or Opus).
+
+    With `X-Synaptic-Job-Id` the synthesis is journaled (see synaptic_jobs.py)
+    so Model Manager can recover the result after losing the transport.
     """
+    job_id = x_synaptic_job_id
+    if job_id is not None and not synaptic_jobs.valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid X-Synaptic-Job-Id.")
+    if job_id is None and synaptic_jobs.require_job_id():
+        raise HTTPException(
+            status_code=403,
+            detail="Synthesis must be queued through Synaptic Model Manager (shared GPU reservation).",
+        )
+    if job_id is not None and request.stream:
+        raise HTTPException(status_code=400, detail="Journaled jobs do not support stream=true.")
     perf_monitor = utils.PerformanceMonitor(
         enabled=config_manager.get_bool("server.enable_performance_monitor", False)
     )
@@ -1352,9 +1371,22 @@ async def custom_tts_endpoint(
             )
         return encoded_audio_bytes
 
+    if job_id is not None:
+        existing = synaptic_jobs.begin(job_id, output_format_str)
+        if existing is not None:
+            if existing["status"] == "succeeded":
+                stored = synaptic_jobs.audio(job_id)
+                if stored is not None:
+                    logger.info(f"Job {job_id} already succeeded; returning journaled audio.")
+                    return StreamingResponse(
+                        io.BytesIO(stored), media_type=f"audio/{existing.get('format', 'wav')}"
+                    )
+            raise HTTPException(status_code=409, detail=f"Job {job_id} is already {existing['status']}.")
+
     _t0 = time.monotonic()
-    loop = asyncio.get_running_loop()
-    encoded_audio_bytes = await loop.run_in_executor(None, _synthesize_and_encode)
+    encoded_audio_bytes = await asyncio.wrap_future(
+        synaptic_jobs.submit(job_id, output_format_str, _synthesize_and_encode)
+    )
     logger.info(f"Non-streaming /tts generation took {time.monotonic() - _t0:.1f}s wall-clock.")
 
     media_type = f"audio/{output_format_str}"
@@ -1403,6 +1435,29 @@ async def custom_tts_endpoint(
         io.BytesIO(encoded_audio_bytes), media_type=media_type, headers=headers
     )
 
+@app.get("/api/jobs/{job_id}", tags=["Synaptic Jobs"])
+async def get_synaptic_job(job_id: str):
+    """Journal entry of a Model Manager dispatch, plus this process's boot id."""
+    if not synaptic_jobs.valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job id.")
+    record = synaptic_jobs.get(job_id)
+    boot = {"boot_id": synaptic_jobs.BOOT_ID, "booted_at": synaptic_jobs.BOOTED_AT}
+    if record is None:
+        return JSONResponse(status_code=404, content={"detail": "Unknown job.", **boot})
+    return {**record, "server": boot}
+
+
+@app.get("/api/jobs/{job_id}/audio", tags=["Synaptic Jobs"])
+async def get_synaptic_job_audio(job_id: str):
+    if not synaptic_jobs.valid_job_id(job_id):
+        raise HTTPException(status_code=400, detail="Invalid job id.")
+    data = synaptic_jobs.audio(job_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="No verified audio for this job.")
+    fmt = (synaptic_jobs.get(job_id) or {}).get("format", "wav")
+    return StreamingResponse(io.BytesIO(data), media_type=f"audio/{fmt}")
+
+
 @app.get("/v1/audio/voices", tags=["llama-swap Compatible"])
 # llama-swap, koboldcpp, and probably some more use this
 async def openai_voices_endpoint(model: str = ""):
@@ -1417,6 +1472,11 @@ async def openai_voices_endpoint(model: str = ""):
 
 @app.post("/v1/audio/speech", tags=["OpenAI Compatible"])
 async def openai_speech_endpoint(request: OpenAISpeechRequest):
+    if synaptic_jobs.require_job_id():
+        raise HTTPException(
+            status_code=403,
+            detail="Synthesis must be queued through Synaptic Model Manager (shared GPU reservation).",
+        )
     # Determine the audio prompt path based on the voice parameter
     predefined_voices_path = get_predefined_voices_path(ensure_absolute=True)
     reference_audio_path = get_reference_audio_path(ensure_absolute=True)
