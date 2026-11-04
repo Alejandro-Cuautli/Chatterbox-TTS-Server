@@ -30,6 +30,7 @@ except ImportError:
     MULTILINGUAL_AVAILABLE = False
 
 # Import the singleton config_manager
+import synaptic_latam  # Synaptic: es-MX/es-419 finetune loader
 from config import config_manager
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,8 @@ MODEL_SELECTOR_MAP = {
     # Multilingual model selectors
     "chatterbox-multilingual": "multilingual",
     "multilingual": "multilingual",
+    # Synaptic: finetune es-MX/es-419 cargado desde model.local_ckpt_dir (synaptic_latam.py)
+    "chatterbox-multilingual-latam": "multilingual",
 }
 
 # Paralinguistic tags supported by Turbo model
@@ -359,8 +362,13 @@ def load_model() -> bool:
                     f"Turbo model supports paralinguistic tags: {TURBO_PARALINGUISTIC_TAGS}"
                 )
 
-            # Load the model using from_pretrained - handles HuggingFace downloads automatically
-            chatterbox_model = model_class.from_pretrained(device=model_device)
+            if model_selector.lower().strip() == synaptic_latam.SELECTOR:
+                chatterbox_model = synaptic_latam.load(
+                    config_manager.get_string("model.local_ckpt_dir", ""), model_device
+                )
+            else:
+                # Load the model using from_pretrained - handles HuggingFace downloads automatically
+                chatterbox_model = model_class.from_pretrained(device=model_device)
 
             # Convert T3 to bfloat16 if enabled.
             # Token generation is memory-bandwidth bound; bf16 halves bytes read per
