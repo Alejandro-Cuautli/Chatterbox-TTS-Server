@@ -109,13 +109,14 @@ jobs:
     # Sin la condición de `tests`: cada commit de main publica su imagen `<sha>-cpu`, también con el veredicto reutilizado.
     if: needs.contract.outputs.backend == 'true'
     runs-on: [self-hosted, X64, synaptic-voice-studio]
-    timeout-minutes: 20
+    # El primer build en frío (apt 3 min + torch 9 min) solo ocurre hasta que main publica la caché.
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
     env:
       IMAGE: ghcr.io/alejandro-cuautli/chatterbox-tts-server:${{ github.event.pull_request.head.sha || github.sha }}-cpu
-      CACHE: ghcr.io/alejandro-cuautli/chatterbox-tts-server:buildcache-cpu
+      CACHE: ghcr.io/alejandro-cuautli/chatterbox-tts-server:main-cpu
     steps:
       - uses: actions/checkout@v4
         with:
@@ -128,32 +129,29 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
       - name: Build and smoke the amd64 CPU runtime
-        # Caché de capas en el registro: el runner es efímero y la capa de torch tardaba 4-10 min.
-        # Solo main escribe la caché; los PR la leen.
+        # Caché inline en la imagen `main-cpu` que publica main: el daemon del runner reutiliza sus capas (torch,
+        # apt) sin reconstruirlas. Driver docker normal: nada de exportar un tarball OCI y cargarlo después
+        # (con buildx docker-container eso costaba más de 6 min por run).
         run: |
           set -euo pipefail
-          cache_to=()
-          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
-            cache_to=(--cache-to "type=registry,ref=$CACHE,mode=max")
-          fi
-          docker buildx build --load --platform linux/amd64 \
-            --cache-from "type=registry,ref=$CACHE" "${cache_to[@]}" \
+          docker build --platform linux/amd64 --build-arg BUILDKIT_INLINE_CACHE=1 --cache-from "$CACHE" \
             --label org.opencontainers.image.source=https://github.com/Alejandro-Cuautli/Chatterbox-TTS-Server \
             --label org.opencontainers.image.revision="$(git rev-parse HEAD)" -f Dockerfile.cpu -t "$IMAGE" .
           test "$(docker image inspect -f '{{.Architecture}}' "$IMAGE")" = amd64
           docker run --rm --network none --entrypoint python "$IMAGE" -c 'import models; assert models.CustomTTSRequest(text="CPU smoke").text == "CPU smoke"'
-      - name: Publish immutable CPU runtime from main
+      - name: Publish immutable CPU runtime from main (y la caché main-cpu)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
           docker push "$IMAGE"
           docker image inspect -f '{{json .RepoDigests}}' "$IMAGE"
+          docker tag "$IMAGE" "$CACHE"
+          docker push "$CACHE"
       - name: Limpieza
         if: always()
         run: |
-          docker image rm -f "$IMAGE" >/dev/null 2>&1 || true
+          docker image rm -f "$IMAGE" "$CACHE" >/dev/null 2>&1 || true
           rm -rf -- "${DOCKER_CONFIG:-/nonexistent}"
 
   ci-result:
