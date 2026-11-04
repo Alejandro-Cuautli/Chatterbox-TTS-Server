@@ -2,9 +2,11 @@
 
 `ResembleAI/Chatterbox-Multilingual-es-mx-latam` (MIT, V3 Single Language Pack) trae
 su propio T3 (`t3_es_mx_latam.safetensors`) y el vocoder `s3gen_v3.pt`; el codificador
-de voz (`ve.pt`) y el tokenizador son los del repo base. `from_pretrained` del paquete
-solo descarga `ResembleAI/chatterbox`, así que se carga desde un directorio local que
-instala y aprueba el Model Manager (nada de descargas desde aquí).
+de voz (`ve.pt`) es el del repo base. `from_pretrained` del paquete solo descarga
+`ResembleAI/chatterbox`, así que el finetune se carga desde el directorio que instala y
+aprueba el Model Manager (models/tts/<org>--<repo>/), y `ve.pt` se toma de ese directorio
+o, si no está, de la caché local del repo base que ya usa producción. Nada se descarga
+desde aquí.
 
 Se elige con `model.repo_id: chatterbox-multilingual-latam` y
 `model.local_ckpt_dir: <directorio>` en config.yaml.
@@ -18,7 +20,6 @@ SELECTOR = "chatterbox-multilingual-latam"
 REQUIRED_FILES = (
     "t3_es_mx_latam.safetensors",
     "s3gen_v3.pt",
-    "ve.pt",
     "grapheme_mtl_merged_expanded_v1.json",
 )
 EXPECTED_MISSING_S3GEN = {"tokenizer._mel_filters", "tokenizer.window"}
@@ -27,6 +28,19 @@ EXPECTED_MISSING_S3GEN = {"tokenizer._mel_filters", "tokenizer.window"}
 def missing_files(ckpt_dir: str | Path) -> list[str]:
     root = Path(ckpt_dir)
     return [name for name in REQUIRED_FILES if not (root / name).is_file()]
+
+
+def voice_encoder_path(ckpt_dir: str | Path) -> Path:
+    local = Path(ckpt_dir) / "ve.pt"
+    if local.is_file():
+        return local
+    from huggingface_hub import hf_hub_download
+    try:
+        return Path(hf_hub_download("ResembleAI/chatterbox", "ve.pt", local_files_only=True))
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"{SELECTOR}: no hay ve.pt en {ckpt_dir} ni en la caché local de ResembleAI/chatterbox."
+        ) from exc
 
 
 def load(ckpt_dir: str | Path, device: str):
@@ -48,7 +62,7 @@ def load(ckpt_dir: str | Path, device: str):
 
     root = Path(ckpt_dir)
     ve = VoiceEncoder()
-    ve.load_state_dict(torch.load(root / "ve.pt", map_location=device, weights_only=True))
+    ve.load_state_dict(torch.load(voice_encoder_path(root), map_location=device, weights_only=True))
     t3 = T3(T3Config.multilingual())
     t3.load_state_dict(load_file(root / "t3_es_mx_latam.safetensors"))
     s3gen = S3Gen()
