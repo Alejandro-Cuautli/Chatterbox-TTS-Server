@@ -1,84 +1,175 @@
-# Hermes CI — runs on every PR, BEFORE merge to main.
-# This is the second test gate (the first runs inside the agent loop on the
-# worktree). Copy into each project repo as .github/workflows/ci.yml.
-#
-# Auto-detects Node (package.json) and/or Python (pyproject.toml/requirements.txt)
-# and runs lint + test + build. Adjust the commands per project as needed.
+# CI de Chatterbox-TTS-Server en los runners X64 efímeros de vps_07 (perfil synaptic-voice-studio).
+# `contract` (antes su propio workflow, mismo nombre de check) decide además qué hace falta probar;
+# `test` y `image` corren en paralelo; `ci-result` es el único veredicto a exigir.
 name: CI
 
 on:
   pull_request:
     branches: [main]
-  # Allow re-running CI on pushes to feature branches too.
   push:
-    branches: [main, "claude/**"]
+    branches: [main]
+  workflow_dispatch:
 
+permissions:
+  contents: read
+
+# En un PR, un push nuevo cancela el run superado; en main nunca se cancela.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  contract:
+    runs-on: [self-hosted, X64, synaptic-voice-studio]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    outputs:
+      backend: ${{ steps.paths.outputs.backend }}
+      tests: ${{ steps.tested.outputs.tests }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Hermes Project Contract self-check
+        run: bash .hermes/contract-check.sh
+      - name: Paths
+        id: paths
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo backend=true >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # El checkout de un PR es su merge con main: el primer padre es main.
+          git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/files"
+          sed 's/^/- /' "$RUNNER_TEMP/files" | head -50
+          # Pesados: el propio CI, las imágenes y las dependencias fuerzan todo.
+          heavy='^(\.github/|Dockerfile\.cpu$|\.dockerignore$|requirements(-test)?\.txt$|docker-compose\.yml$)'
+          if grep -qE "$heavy" "$RUNNER_TEMP/files"; then
+            echo backend=true >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Documentación sola no prueba nada. Se mira la salida, no el código de grep.
+          b=false
+          [ -n "$(grep -vE '(\.md$|^docs/)' "$RUNNER_TEMP/files" || true)" ] && b=true
+          echo "backend=$b" | tee -a "$GITHUB_OUTPUT"
+      - name: Reuse the PR verdict on main
+        id: tested
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" != push ] || [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo tests=true >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          api() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/$1"; }
+          tests=true
+          if head=$(api "commits/$GITHUB_SHA/pulls" | jq -r '[.[] | select(.merged_at != null)][0].head.sha // empty') && [ -n "$head" ]; then
+            tree_head=$(api "git/commits/$head" | jq -r .tree.sha)
+            green=$(api "commits/$head/check-runs?check_name=ci-result&per_page=20" | jq '[.check_runs[] | select(.conclusion == "success")] | length')
+            if [ "$tree_head" = "$(git rev-parse 'HEAD^{tree}')" ] && [ "$green" -gt 0 ]; then
+              tests=false
+              echo "main $GITHUB_SHA tiene el mismo árbol que la cabeza $head de su PR, con ci-result verde: no se repiten los tests." | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          echo "tests=$tests" >> "$GITHUB_OUTPUT"
+
   test:
-    runs-on: [self-hosted, X64, synaptic-voice-studio, ephemeral]
+    needs: contract
+    if: needs.contract.outputs.backend == 'true' && needs.contract.outputs.tests == 'true'
+    runs-on: [self-hosted, X64, synaptic-voice-studio]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # uv (venv) sin python3-venv en el host del farm
+        with:
+          activate-environment: 'true'
+          enable-cache: 'true'
+          cache-dependency-glob: requirements*.txt
+          python-version: '3.10'
+      - name: Dependencias
+        # Mismo motor que Dockerfile.cpu/start.py: chatterbox queda fuera de requirements.txt y va con --no-deps.
+        # unsafe-best-match = el comportamiento de pip con el índice CPU de PyTorch como índice extra.
+        run: |
+          set -euo pipefail
+          uv pip install --index-strategy unsafe-best-match -r requirements.txt
+          uv pip install --no-deps git+https://github.com/devnen/chatterbox-v2.git@master s3tokenizer==0.3.0 onnx==1.16.0
+          uv pip install "protobuf>=4.25.0" -r requirements-test.txt
+      - name: Lint (Python 3.10)
+        run: ruff check --target-version py310 .
+      - name: Tests
+        run: pytest -q
+
+  image:
+    needs: contract
+    # Sin la condición de `tests`: cada commit de main publica su imagen `<sha>-cpu`, también con el veredicto reutilizado.
+    if: needs.contract.outputs.backend == 'true'
+    runs-on: [self-hosted, X64, synaptic-voice-studio]
+    # El primer build en frío (apt 3 min + torch 9 min) solo ocurre hasta que main publica la caché.
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
     env:
       IMAGE: ghcr.io/alejandro-cuautli/chatterbox-tts-server:${{ github.event.pull_request.head.sha || github.sha }}-cpu
+      CACHE: ghcr.io/alejandro-cuautli/chatterbox-tts-server:main-cpu
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # uv (venv) sin python3-venv en el host del farm
         with:
-          enable-cache: 'false'
-          python-version: '3.10'
-
-      # ---- Node ----
-      - name: Setup Node
-        if: ${{ hashFiles('package.json') != '' }}
-        uses: actions/setup-node@v4
+          persist-credentials: false
+      - name: Credenciales de registro aisladas
+        run: echo "DOCKER_CONFIG=$(mktemp -d "$RUNNER_TEMP/tts-docker.XXXXXX")" >> "$GITHUB_ENV"
+      - name: Login en ghcr (caché de capas y publicación)
+        uses: docker/login-action@v3
         with:
-          node-version: '20'
-          cache: 'npm'
-      - name: Node install + lint + test + build
-        if: ${{ hashFiles('package.json') != '' }}
-        run: |
-          npm ci
-          npm run lint --if-present
-          npm test --if-present
-          npm run build --if-present
-
-      # ---- Python ----
-      - name: Python install + test
-        if: ${{ hashFiles('pyproject.toml', 'requirements.txt') != '' }}
-        run: |
-          uv venv --python 3.10 --seed .venv-ci
-          . .venv-ci/bin/activate
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f pyproject.toml ]; then pip install -e .; fi
-          # Same engine install as Dockerfile.cpu/start.py: chatterbox is kept out of
-          # requirements.txt and must be installed with --no-deps.
-          pip install --no-deps git+https://github.com/devnen/chatterbox-v2.git@master s3tokenizer==0.3.0 onnx==1.16.0
-          pip install "protobuf>=4.25.0"
-          pip install -r requirements-test.txt
-          # Preserve Python 3.10 compatibility even when farm defaults target newer Python.
-          ruff check --target-version py310 .
-          pytest -q
-
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and smoke the amd64 CPU runtime
+        # Caché inline en la imagen `main-cpu` que publica main: el daemon del runner reutiliza sus capas (torch,
+        # apt) sin reconstruirlas. Driver docker normal: nada de exportar un tarball OCI y cargarlo después
+        # (con buildx docker-container eso costaba más de 6 min por run).
         run: |
           set -euo pipefail
-          docker build --platform linux/amd64 --label org.opencontainers.image.source=https://github.com/Alejandro-Cuautli/Chatterbox-TTS-Server --label org.opencontainers.image.revision="$(git rev-parse HEAD)" -f Dockerfile.cpu -t "$IMAGE" .
+          docker build --platform linux/amd64 --build-arg BUILDKIT_INLINE_CACHE=1 --cache-from "$CACHE" \
+            --label org.opencontainers.image.source=https://github.com/Alejandro-Cuautli/Chatterbox-TTS-Server \
+            --label org.opencontainers.image.revision="$(git rev-parse HEAD)" -f Dockerfile.cpu -t "$IMAGE" .
           test "$(docker image inspect -f '{{.Architecture}}' "$IMAGE")" = amd64
           docker run --rm --network none --entrypoint python "$IMAGE" -c 'import models; assert models.CustomTTSRequest(text="CPU smoke").text == "CPU smoke"'
-      - name: Publish immutable CPU runtime from main
+      - name: Publish immutable CPU runtime from main (y la caché main-cpu)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          export DOCKER_CONFIG=$(mktemp -d "$RUNNER_TEMP/tts-publish.XXXXXX")
-          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
-          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker push "$IMAGE"
           docker image inspect -f '{{json .RepoDigests}}' "$IMAGE"
+          docker tag "$IMAGE" "$CACHE"
+          docker push "$CACHE"
+      - name: Limpieza
+        if: always()
+        run: |
+          docker image rm -f "$IMAGE" "$CACHE" >/dev/null 2>&1 || true
+          rm -rf -- "${DOCKER_CONFIG:-/nonexistent}"
+
+  ci-result:
+    if: always()
+    needs: [contract, test, image]
+    runs-on: [self-hosted, X64, synaptic-voice-studio]
+    timeout-minutes: 5
+    steps:
+      - name: Require every gate
+        env:
+          CONTRACT: ${{ needs.contract.result }}
+          TEST: ${{ needs.test.result }}
+          IMAGE: ${{ needs.image.result }}
+          # Saltos legítimos (OPTIONAL_SKIP): solo docs, o main con el mismo árbol que un PR ya verde.
+          OPTIONAL_SKIP: ${{ needs.contract.outputs.backend == 'false' || needs.contract.outputs.tests == 'false' }}
+        run: |
+          set -u
+          echo "contract=$CONTRACT test=$TEST image=$IMAGE optional_skip=$OPTIONAL_SKIP"
+          test "$CONTRACT" = success || exit 1
+          ok() { [ "$1" = success ] || { [ "$1" = skipped ] && [ "$OPTIONAL_SKIP" = true ]; }; }
+          ok "$TEST" && ok "$IMAGE"
