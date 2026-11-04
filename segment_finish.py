@@ -36,13 +36,18 @@ class FinishSpec:
     highpass_hz: float = 70.0
     target_lufs: float = -18.0
     true_peak_db: float = -1.5
-    # Detección de voz: tramos de 10 ms por encima de max(-60 dBFS, pico - 40 dB). Con 45 dB
-    # entraba el siseo que Chatterbox deja tras la última palabra (-55 dB durante ~0,7 s,
-    # medido en producción el 2026-11-04): ese es parte del ruido en las uniones.
-    # Margen extra alrededor de lo detectado para no comerse consonantes de baja
-    # energía (la «t» o la «s» iniciales) ni la caída natural de la última sílaba.
-    gate_floor_db: float = -60.0
-    gate_below_peak_db: float = 40.0
+    # Detección de voz por islas (regla acordada con montaje, F4, el 2026-11-04): tramos de
+    # 10 ms por encima de max(p95 - 30 dB, suelo + 10 dB, -62 dBFS), unidos si el hueco es
+    # < 300 ms; una isla es voz solo si su pico llega a p95 - 18 dB. Un umbral fijo dejaba
+    # pasar el ruido que Chatterbox genera tras la última palabra (hasta -39 dBFS durante
+    # 1,3 s en job_054575ba S02, -55 dB ~0,7 s en otros): parte del ruido en las uniones.
+    # Margen extra alrededor de la voz para no comerse consonantes de baja energía (la «t»
+    # o la «s» iniciales) ni la caída natural de la última sílaba.
+    gate_below_p95_db: float = 30.0
+    gate_above_floor_db: float = 10.0
+    gate_abs_db: float = -62.0
+    island_join_s: float = 0.300
+    island_peak_below_p95_db: float = 18.0
     pre_roll_s: float = 0.040
     post_roll_s: float = 0.080
 
@@ -87,18 +92,29 @@ def true_peak_db(audio: np.ndarray) -> float:
 
 
 def speech_bounds(audio: np.ndarray, sr: int, spec: FinishSpec) -> tuple[int, int] | None:
-    """[inicio, fin) en muestras de los tramos por encima de la puerta. None si es silencio."""
+    """[inicio, fin) en muestras de las islas de voz (ver FinishSpec). None si es silencio."""
     hop = max(1, int(0.010 * sr))
     n = len(audio) // hop
     if n == 0:
         return None
     frames = audio[: n * hop].reshape(n, hop).astype(np.float64)
     rms_db = 10 * np.log10(np.maximum(np.mean(frames ** 2, axis=1), 1e-12))
-    thr = max(spec.gate_floor_db, rms_db.max() - spec.gate_below_peak_db)
+    p95 = float(np.percentile(rms_db, 95))
+    floor = float(np.percentile(rms_db, 10))
+    # Sin silencio en el segmento el p10 es la propia voz: el término del suelo no puede
+    # pasar de p95 - 20 dB o la puerta lo cerraría entero.
+    floor_term = min(floor + spec.gate_above_floor_db, p95 - 20.0)
+    thr = max(p95 - spec.gate_below_p95_db, floor_term, spec.gate_abs_db)
     active = np.flatnonzero(rms_db > thr)
     if not len(active):
         return None
-    return int(active[0] * hop), int((active[-1] + 1) * hop)
+    join = max(1, round(spec.island_join_s / 0.010))
+    cuts = np.flatnonzero(np.diff(active) > join)
+    islands = np.split(active, cuts + 1)
+    voiced = [isl for isl in islands if rms_db[isl].max() >= p95 - spec.island_peak_below_p95_db]
+    if not voiced:
+        return None
+    return int(voiced[0][0] * hop), int((voiced[-1][-1] + 1) * hop)
 
 
 def finish(audio: np.ndarray, sr: int, spec: FinishSpec | None = None) -> tuple[np.ndarray, int]:

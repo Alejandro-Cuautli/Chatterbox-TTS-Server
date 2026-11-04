@@ -63,10 +63,10 @@ def test_quiet_onset_before_vowel_is_kept():
     seg = np.concatenate([np.zeros(int(0.2 * sr), np.float32), consonant, _voice(sr, 1.0, 0.8, lead=0.0)])
     out, osr = sf.finish(seg, sr)
     onset = np.flatnonzero(np.abs(out) > 1e-4)[0] / osr
-    # La voz empieza en el margen de cabeza y la consonante (30 ms antes de la vocal) no se recorta.
-    assert onset == pytest.approx(SPEC.head_s, abs=0.005)
-    vowel = onset + 0.03
-    assert vowel > SPEC.head_s + 0.02
+    # La consonante (30 ms antes de la vocal, bajo la puerta) cae en el pre-roll: no se recorta.
+    assert SPEC.head_s - SPEC.pre_roll_s <= onset <= SPEC.head_s - 0.02
+    vowel = np.flatnonzero(np.abs(out) > 0.1)[0] / osr
+    assert vowel == pytest.approx(SPEC.head_s, abs=0.012)
 
 
 def test_silence_returns_only_margins():
