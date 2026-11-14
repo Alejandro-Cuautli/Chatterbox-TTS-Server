@@ -39,6 +39,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 import engine  # TTS Engine interface
+import segment_finish  # Synaptic per-segment audio contract (render hand-off)
 import synaptic_jobs  # Durable job journal for Model Manager dispatches
 import utils  # Utility functions
 
@@ -1351,11 +1352,21 @@ async def custom_tts_endpoint(
                 status_code=500, detail=f"Audio stitching error: {e_concat}"
             )
 
+        encode_sample_rate = engine_output_sample_rate
+        target_sample_rate = final_output_sample_rate
+        if config_manager.get_bool("audio_processing.synaptic_segment_finish", False):
+            # Synaptic: margins, edge ramps, -18 LUFS and 48 kHz (see segment_finish.py).
+            final_audio_np, encode_sample_rate = segment_finish.finish(
+                final_audio_np, engine_output_sample_rate
+            )
+            target_sample_rate = encode_sample_rate
+            perf_monitor.record("Synaptic segment finish applied")
+
         encoded_audio_bytes = utils.encode_audio(
             audio_array=final_audio_np,
-            sample_rate=engine_output_sample_rate,
+            sample_rate=encode_sample_rate,
             output_format=output_format_str,
-            target_sample_rate=final_output_sample_rate,
+            target_sample_rate=target_sample_rate,
         )
         perf_monitor.record(
             f"Final audio encoded to {output_format_str} (target SR: {final_output_sample_rate}Hz from engine SR: {engine_output_sample_rate}Hz)"
